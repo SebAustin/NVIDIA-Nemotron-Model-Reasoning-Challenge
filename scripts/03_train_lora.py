@@ -131,10 +131,13 @@ def run_sft(use_unsloth: bool = True) -> None:
             add_generation_prompt=False,
         )
 
+    # Use 4096 for training on 2×T4 (16GB each) to avoid OOM; inference can still use 8192.
+    max_seq = int(os.environ.get("SFT_MAX_SEQ_LENGTH", "4096"))
     sft_config = SFTConfig(
         output_dir=LORA_OUTPUT_DIR,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=16,
+        gradient_checkpointing=True,
         warmup_ratio=0.05,
         num_train_epochs=3,
         learning_rate=2e-4,
@@ -150,7 +153,7 @@ def run_sft(use_unsloth: bool = True) -> None:
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         dataloader_num_workers=4,
-        max_seq_length=8192,
+        max_seq_length=max_seq,
         dataset_text_field=None,
         report_to="none",
     )

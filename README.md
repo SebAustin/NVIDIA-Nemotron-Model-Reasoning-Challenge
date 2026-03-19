@@ -44,7 +44,7 @@ If that fails (no matching pre-built wheel), try: `pip install vllm --pre --extr
 
 1. **Competition data**: Download `train.csv` and `test.csv` from Kaggle into `data/`.
 2. **CoT generation** (Phase 2): Set `ANTHROPIC_API_KEY` (or configure another API) for chain-of-thought generation.
-3. **GPU**: Training and vLLM evaluation require a GPU (e.g. ~24GB VRAM for 4-bit LoRA). On Kaggle, **Tesla P100 (compute capability 6.0) is not supported** by the default PyTorch build; if you see "Some modules are dispatched on the CPU", re-run the notebook to get a different GPU (e.g. T4, V100, A100).
+3. **GPU**: Training and vLLM evaluation require a GPU (e.g. ~24GB VRAM for 4-bit LoRA). On Kaggle, **Tesla P100 (compute capability 6.0) is not supported** by the default PyTorch build; if you see "Some modules are dispatched on the CPU", re-run the notebook to get a different GPU (e.g. T4, V100, A100). For **2×T4 (16GB each)**, training uses `max_seq_length=4096` by default to avoid OOM; set `SFT_MAX_SEQ_LENGTH=8192` only if you have more VRAM.
 
 ## Project layout
 
