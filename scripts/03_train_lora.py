@@ -68,14 +68,25 @@ def load_model_peft():
         bnb_4bit_compute_dtype=torch.bfloat16,
         bnb_4bit_use_double_quant=True,
     )
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        config=_get_model_config(),
-        quantization_config=bnb_config,
-        device_map="auto",
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-    )
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            config=_get_model_config(),
+            quantization_config=bnb_config,
+            device_map="auto",
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+        )
+    except ValueError as e:
+        if "dispatched on the CPU or the disk" in str(e):
+            cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
+            raise RuntimeError(
+                f"Model could not fit on GPU. {e}\n"
+                f"Your GPU compute capability is {cap[0]}.{cap[1]}. "
+                "On Kaggle, Tesla P100 (6.0) is not supported by the default PyTorch. "
+                "Re-run the notebook to get a different GPU (e.g. T4, V100, A100), or use a competition that provides one."
+            ) from e
+        raise
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -283,6 +294,17 @@ def main() -> None:
             "Use run_all.py --skip-train to run only EDA, data prep, and packaging locally."
         )
         sys.exit(1)
+    # Kaggle sometimes assigns Tesla P100 (sm_60); default PyTorch there does not support sm_60.
+    try:
+        cap = torch.cuda.get_device_capability()
+        if cap[0] < 7:
+            print(
+                f"Warning: GPU compute capability is {cap[0]}.{cap[1]} (e.g. Tesla P100).\n"
+                "Kaggle's PyTorch often does not support sm_60. If loading fails with 'dispatched on the CPU',\n"
+                "re-run the notebook to get a different GPU (e.g. T4, V100, A100) or use a competition with a supported GPU."
+            )
+    except Exception:
+        pass
 
     if args.grpo:
         run_grpo()
