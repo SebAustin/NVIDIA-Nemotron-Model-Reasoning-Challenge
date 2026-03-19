@@ -53,6 +53,7 @@ def main() -> int:
     parser.add_argument("--skip-eval", action="store_true", help="Skip Phase 4 evaluation")
     parser.add_argument("--skip-package", action="store_true", help="Skip Phase 5 packaging")
     parser.add_argument("--max-cot", type=int, default=None, help="Phase 2: max CoT examples")
+    parser.add_argument("--peft-only", action="store_true", help="Phase 3: use PEFT only (skip Unsloth; use on Kaggle if Unsloth CUDA kernel errors)")
     args = parser.parse_args()
 
     steps = [
@@ -61,7 +62,7 @@ def main() -> int:
             ["--synthetic-only"] if args.synthetic_only else []
             + (["--max-cot", str(args.max_cot)] if args.max_cot is not None else [])
         )),
-        (not args.skip_train, "03_train_lora.py", []),
+        (not args.skip_train, "03_train_lora.py", ["--peft-only"] if args.peft_only else []),
         (not args.skip_eval, "04_evaluate.py", []),
         (not args.skip_package, "05_package_submission.py", []),
     ]

@@ -18,7 +18,7 @@ python run_all.py --skip-train --skip-eval   # local (no GPU)
 
 Use **`kaggle_notebook.ipynb`** to run the full pipeline on Kaggle and produce `submission.zip`.
 
-**Input dataset:** Add the **competition dataset** to the notebook (via “Add Data” on the [NVIDIA Nemotron Model Reasoning Challenge](https://www.kaggle.com/competitions/nvidia-nemotron-model-reasoning-challenge) page). It must include **train.csv** (columns: `id`, `prompt`, `answer`) and **test.csv** (columns: `id`, `prompt`). You also need to provide the project code: either set `GITHUB_REPO` to a public repo URL (and enable Internet), or add a Kaggle Dataset that contains this project (e.g. a zip with `scripts/`, `run_all.py`, `requirements.txt`). See the notebook’s first cell for details.
+**Input dataset:** Add the **competition dataset** to the notebook (via “Add Data” on the [NVIDIA Nemotron Model Reasoning Challenge](https://www.kaggle.com/competitions/nvidia-nemotron-model-reasoning-challenge) page). It must include **train.csv** (columns: `id`, `prompt`, `answer`) and **test.csv** (columns: `id`, `prompt`). You also need to provide the project code: either set `GITHUB_REPO` to a public repo URL (and enable Internet), or add a Kaggle Dataset that contains this project (e.g. a zip with `scripts/`, `run_all.py`, `requirements.txt`). See the notebook’s first cell for details. Keep **USE_PEFT_ONLY = True** to avoid Unsloth CUDA kernel errors on newer Kaggle GPUs (e.g. Blackwell).
 
 ## Setup (one-time)
 

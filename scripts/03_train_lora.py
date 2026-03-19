@@ -50,6 +50,14 @@ def load_model_unsloth():
     return model, tokenizer
 
 
+def _get_model_config():
+    """Load config with tie_word_embeddings=False to silence tied-weights warning."""
+    from transformers import AutoConfig
+    config = AutoConfig.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    config.tie_word_embeddings = False
+    return config
+
+
 def load_model_peft():
     from peft import LoraConfig, get_peft_model, TaskType
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -62,6 +70,7 @@ def load_model_peft():
     )
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
+        config=_get_model_config(),
         quantization_config=bnb_config,
         device_map="auto",
         torch_dtype=torch.bfloat16,
@@ -199,7 +208,11 @@ def run_grpo() -> None:
     # Load base model then load SFT adapter
     print("Loading base model and SFT adapter for GRPO...")
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME, device_map="auto", torch_dtype=torch.bfloat16, trust_remote_code=True
+        MODEL_NAME,
+        config=_get_model_config(),
+        device_map="auto",
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
     )
     model = PeftModel.from_pretrained(model, LORA_ADAPTER_DIR)
     tokenizer = AutoTokenizer.from_pretrained(LORA_ADAPTER_DIR, trust_remote_code=True)
