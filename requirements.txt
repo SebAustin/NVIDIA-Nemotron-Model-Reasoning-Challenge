@@ -1,0 +1,16 @@
+torch>=2.1.0
+transformers>=4.45.0
+peft>=0.12.0
+trl>=0.12.0
+datasets
+# vllm: install separately for Phase 4 (eval). Use requirements-vllm.txt on Linux+CUDA.
+unsloth
+accelerate
+bitsandbytes
+pandas
+numpy
+wandb
+scikit-learn
+anthropic
+huggingface_hub
+jinja2
