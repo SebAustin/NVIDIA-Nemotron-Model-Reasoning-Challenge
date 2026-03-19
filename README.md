@@ -5,7 +5,7 @@ Pipeline for the [NVIDIA Nemotron Model Reasoning Challenge](https://www.kaggle.
 ## Clone and run (from GitHub)
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/nemotron-reasoning-challenge.git
+git clone https://github.com/SebAustin/nemotron-reasoning-challenge.git
 cd nemotron-reasoning-challenge
 bash setup_venv.sh
 source .venv/bin/activate
