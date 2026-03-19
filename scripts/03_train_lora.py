@@ -99,6 +99,8 @@ def load_model_peft():
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     )
     model = get_peft_model(model, lora_config)
+    model.gradient_checkpointing_enable()
+    model.enable_input_require_grads()  # required for gradient checkpointing with LoRA
     model.print_trainable_parameters()
     return model, tokenizer
 
@@ -131,8 +133,8 @@ def run_sft(use_unsloth: bool = True) -> None:
 
     sft_config = SFTConfig(
         output_dir=LORA_OUTPUT_DIR,
-        per_device_train_batch_size=2,
-        gradient_accumulation_steps=8,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=16,
         warmup_ratio=0.05,
         num_train_epochs=3,
         learning_rate=2e-4,
