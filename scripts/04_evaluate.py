@@ -50,7 +50,7 @@ def load_eval_data():
 def build_prompts_for_inference(prompts: list[str], system_prompt: str) -> list[str]:
     """Build full prompt (system + user) for each item using chat template."""
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     out = []
     for user_text in prompts:
         messages = [

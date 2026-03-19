@@ -121,7 +121,7 @@ def main() -> None:
 
     os.chdir(PROJECT_ROOT)
 
-    tokenizer = AutoTokenizer.from_pretrained("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
+    tokenizer = AutoTokenizer.from_pretrained("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", trust_remote_code=True)
     all_records = []
 
     if not args.synthetic_only:

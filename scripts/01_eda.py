@@ -105,7 +105,7 @@ def main() -> None:
 
     # Tokenizer
     print("Loading Nemotron tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
+    tokenizer = AutoTokenizer.from_pretrained("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", trust_remote_code=True)
     train["prompt_tokens"] = train["prompt"].apply(
         lambda x: len(tokenizer.encode(x, add_special_tokens=False)) if isinstance(x, str) else 0
     )

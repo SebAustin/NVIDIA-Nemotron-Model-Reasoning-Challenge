@@ -25,7 +25,7 @@ MODEL_NAME = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 
 def get_tokenizer():
     from transformers import AutoTokenizer
-    return AutoTokenizer.from_pretrained(MODEL_NAME)
+    return AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
 
 
 def load_model_unsloth():
@@ -35,6 +35,7 @@ def load_model_unsloth():
         max_seq_length=8192,
         dtype=torch.bfloat16,
         load_in_4bit=True,
+        trust_remote_code=True,
     )
     model = FastLanguageModel.get_peft_model(
         model,
@@ -64,8 +65,9 @@ def load_model_peft():
         quantization_config=bnb_config,
         device_map="auto",
         torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
     )
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
 
     lora_config = LoraConfig(
@@ -197,10 +199,10 @@ def run_grpo() -> None:
     # Load base model then load SFT adapter
     print("Loading base model and SFT adapter for GRPO...")
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME, device_map="auto", torch_dtype=torch.bfloat16
+        MODEL_NAME, device_map="auto", torch_dtype=torch.bfloat16, trust_remote_code=True
     )
     model = PeftModel.from_pretrained(model, LORA_ADAPTER_DIR)
-    tokenizer = AutoTokenizer.from_pretrained(LORA_ADAPTER_DIR)
+    tokenizer = AutoTokenizer.from_pretrained(LORA_ADAPTER_DIR, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
 
     # Dataset: need "prompt" and "answer" for reward. Build from train_sft.jsonl.
