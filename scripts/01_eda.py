@@ -6,6 +6,24 @@ import os
 import re
 import sys
 
+# Ensure project root is on path when run from any cwd (e.g. Kaggle)
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+try:
+    from scripts.utils.model_utils import local_load_kwargs, resolve_model_path
+except ModuleNotFoundError:
+    import importlib.util
+    _spec = importlib.util.spec_from_file_location(
+        "model_utils",
+        os.path.join(os.path.dirname(__file__), "utils", "model_utils.py"),
+    )
+    _mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    local_load_kwargs = _mod.local_load_kwargs
+    resolve_model_path = _mod.resolve_model_path
+
 import pandas as pd
 import numpy as np
 from transformers import AutoTokenizer
@@ -103,9 +121,11 @@ def main() -> None:
     train["puzzle_type"] = train["prompt"].apply(categorize_puzzle_type)
     test["puzzle_type"] = test["prompt"].apply(categorize_puzzle_type)
 
-    # Tokenizer
+    # Tokenizer (use NEMOTRON_MODEL_PATH for offline Kaggle: path to model dir in an input dataset)
+    model_path_raw = os.environ.get("NEMOTRON_MODEL_PATH", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
+    model_path = resolve_model_path(model_path_raw)
     print("Loading Nemotron tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, **local_load_kwargs(model_path_raw))
     train["prompt_tokens"] = train["prompt"].apply(
         lambda x: len(tokenizer.encode(x, add_special_tokens=False)) if isinstance(x, str) else 0
     )

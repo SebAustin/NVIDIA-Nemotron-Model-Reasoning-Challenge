@@ -11,6 +11,9 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+# Must run before `import torch` / first CUDA alloc (Kaggle OOM hints often cite the wrong var name).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:128")
+
 import torch
 from datasets import load_dataset
 from trl import SFTConfig, SFTTrainer
@@ -20,22 +23,80 @@ DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 TRAIN_SFT_JSONL = os.path.join(DATA_DIR, "train_sft.jsonl")
 LORA_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "lora_output")
 LORA_ADAPTER_DIR = os.path.join(PROJECT_ROOT, "lora_adapter")
-MODEL_NAME = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+from scripts.utils.model_utils import local_load_kwargs, resolve_model_path
+
+_MODEL_PATH_RAW = os.environ.get("NEMOTRON_MODEL_PATH", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
+MODEL_NAME = resolve_model_path(_MODEL_PATH_RAW)
+
+
+def _local_load_kwargs() -> dict:
+    return local_load_kwargs(_MODEL_PATH_RAW)
+
+
+def _hf_offload_dir() -> str:
+    d = os.path.join(PROJECT_ROOT, "hf_offload")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _device_map_kwargs_for_quantized_load() -> dict:
+    """
+    Cap VRAM per GPU so a 30B 4-bit MoE splits across GPUs + CPU/RAM instead of filling GPU 0 during load.
+
+    Parallel tensor materialization can briefly spike one GPU; defaults are conservative (~7–9 GiB/GPU on 2×T4).
+    Env:
+      SFT_MAX_MEMORY_GB_PER_GPU — same cap for every GPU (overrides asymmetric defaults)
+      SFT_MAX_MEMORY_GB_GPU0 / SFT_MAX_MEMORY_GB_GPU1 — per-device GiB (when SFT_MAX_MEMORY_GB_PER_GPU unset)
+      SFT_MAX_MEMORY_CPU — CPU RAM budget for offload (default 160GiB)
+    """
+    if not torch.cuda.is_available():
+        return {}
+    n = torch.cuda.device_count()
+    cpu_cap = os.environ.get("SFT_MAX_MEMORY_CPU", "160GiB")
+    if cpu_cap.isdigit():
+        cpu_cap = f"{cpu_cap}GiB"
+
+    uniform = os.environ.get("SFT_MAX_MEMORY_GB_PER_GPU")
+    max_memory: dict = {}
+    if uniform is not None:
+        gb = int(uniform)
+        max_memory = {i: f"{gb}GiB" for i in range(n)}
+    elif n >= 2:
+        g0 = int(os.environ.get("SFT_MAX_MEMORY_GB_GPU0", "7"))
+        g1 = int(os.environ.get("SFT_MAX_MEMORY_GB_GPU1", "9"))
+        max_memory = {0: f"{g0}GiB", 1: f"{g1}GiB"}
+        for i in range(2, n):
+            max_memory[i] = f"{g1}GiB"
+    else:
+        g0 = int(os.environ.get("SFT_MAX_MEMORY_GB_GPU0", "5"))
+        max_memory = {0: f"{g0}GiB"}
+
+    max_memory["cpu"] = cpu_cap
+    gpu_caps = {k: max_memory[k] for k in max_memory if k != "cpu"}
+    print(f"Quantized load: {n} GPU(s), max_memory (GPUs) = {gpu_caps}, CPU = {cpu_cap}")
+    return {
+        "device_map": "auto",
+        "max_memory": max_memory,
+        "low_cpu_mem_usage": True,
+        "offload_folder": _hf_offload_dir(),
+    }
 
 
 def get_tokenizer():
     from transformers import AutoTokenizer
-    return AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    return AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True, **_local_load_kwargs())
 
 
 def load_model_unsloth():
     from unsloth import FastLanguageModel
+    kw = _local_load_kwargs()
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=MODEL_NAME,
         max_seq_length=8192,
         dtype=torch.bfloat16,
         load_in_4bit=True,
         trust_remote_code=True,
+        **kw,
     )
     model = FastLanguageModel.get_peft_model(
         model,
@@ -53,7 +114,7 @@ def load_model_unsloth():
 def _get_model_config():
     """Load config with tie_word_embeddings=False to silence tied-weights warning."""
     from transformers import AutoConfig
-    config = AutoConfig.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(MODEL_NAME, trust_remote_code=True, **_local_load_kwargs())
     config.tie_word_embeddings = False
     return config
 
@@ -68,15 +129,48 @@ def load_model_peft():
         bnb_4bit_compute_dtype=torch.bfloat16,
         bnb_4bit_use_double_quant=True,
     )
+    if torch.cuda.device_count() < 2:
+        print(
+            "Warning: Only one GPU is visible. 30B MoE in 4-bit needs ~15GB+ VRAM for weights; use **2× T4** on Kaggle "
+            "(Accelerator → 2× GPU) so the model splits across GPUs. Single T4 will CPU-offload and often OOM or train very slowly."
+        )
+    map_kw = _device_map_kwargs_for_quantized_load()
+    # Cap fraction of each GPU PyTorch may use (reduces OOM during parallel weight materialization).
+    frac = float(os.environ.get("SFT_CUDA_MEMORY_FRACTION", "0.82"))
+    for i in range(torch.cuda.device_count()):
+        try:
+            torch.cuda.set_per_process_memory_fraction(frac, i)
+        except Exception:
+            pass
+    torch.cuda.empty_cache()
     try:
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME,
             config=_get_model_config(),
             quantization_config=bnb_config,
-            device_map="auto",
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
+            **_local_load_kwargs(),
+            **map_kw,
         )
+    except torch.OutOfMemoryError as e:
+        raise RuntimeError(
+            "CUDA OOM while loading the 4-bit model. Try: (1) Kaggle **2× GPU T4** not 1×; "
+            "(2) lower caps, e.g. SFT_MAX_MEMORY_GB_GPU0=6 SFT_MAX_MEMORY_GB_GPU1=8 or SFT_MAX_MEMORY_GB_PER_GPU=6; "
+            "(3) SFT_CUDA_MEMORY_FRACTION=0.78; (4) more CPU RAM for offload: SFT_MAX_MEMORY_CPU=200. "
+            f"Original error: {e}"
+        ) from e
+    except ImportError as e:
+        err = str(e)
+        if "selective_scan_cuda" in err or "c10_cuda" in err or "mamba_ssm" in err:
+            raise RuntimeError(
+                "mamba_ssm CUDA extensions do not match your installed PyTorch (ABI mismatch). "
+                "Typical on Kaggle after `pip install` upgrades torch. Fix: run\n"
+                "  pip install mamba-ssm causal-conv1d --no-cache-dir --force-reinstall\n"
+                "and use requirements-kaggle-peft.txt (no torch line) so pip does not upgrade torch.\n"
+                f"Original: {e}"
+            ) from e
+        raise
     except ValueError as e:
         if "dispatched on the CPU or the disk" in str(e):
             cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
@@ -87,12 +181,13 @@ def load_model_peft():
                 "Re-run the notebook to get a different GPU (e.g. T4, V100, A100), or use a competition that provides one."
             ) from e
         raise
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True, **_local_load_kwargs())
     tokenizer.pad_token = tokenizer.eos_token
 
+    lora_r = int(os.environ.get("LORA_R", "32"))
     lora_config = LoraConfig(
-        r=32,
-        lora_alpha=64,
+        r=lora_r,
+        lora_alpha=2 * lora_r,
         lora_dropout=0.05,
         bias="none",
         task_type=TaskType.CAUSAL_LM,
@@ -131,8 +226,8 @@ def run_sft(use_unsloth: bool = True) -> None:
             add_generation_prompt=False,
         )
 
-    # Use 4096 for training on 2×T4 (16GB each) to avoid OOM; inference can still use 8192.
-    max_seq = int(os.environ.get("SFT_MAX_SEQ_LENGTH", "4096"))
+    # Default 2048 for 2×T4 (16GB each); set SFT_MAX_SEQ_LENGTH=4096 or 8192 if you have more VRAM.
+    max_seq = int(os.environ.get("SFT_MAX_SEQ_LENGTH", "2048"))
     sft_config = SFTConfig(
         output_dir=LORA_OUTPUT_DIR,
         per_device_train_batch_size=1,
@@ -229,6 +324,7 @@ def run_grpo() -> None:
         device_map="auto",
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
+        **_local_load_kwargs(),
     )
     model = PeftModel.from_pretrained(model, LORA_ADAPTER_DIR)
     tokenizer = AutoTokenizer.from_pretrained(LORA_ADAPTER_DIR, trust_remote_code=True)

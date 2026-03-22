@@ -1,0 +1,27 @@
+# Anaconda Cloud / local conda environment
+# Use: conda env create -f environment.yml
+# For Anaconda Notebooks: pick a PyTorch+GPU runtime, then pip install -r requirements-kaggle-peft.txt
+name: nemotron-reasoning
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.10
+  - pip
+  - pytorch>=2.1.0
+  - torchvision
+  - pip:
+    - transformers>=4.45.0
+    - peft>=0.12.0
+    - trl>=0.12.0
+    - datasets
+    - accelerate
+    - bitsandbytes
+    - pandas
+    - numpy
+    - scikit-learn
+    - huggingface_hub
+    - jinja2
+    - causal-conv1d
+    - mamba-ssm

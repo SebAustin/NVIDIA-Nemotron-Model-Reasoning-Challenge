@@ -1,0 +1,23 @@
+# Kaggle / PEFT-only / synthetic-only (no Unsloth, wandb, anthropic).
+#
+# IMPORTANT — do not list `torch` here on Kaggle: pip upgrading torch leaves
+# mamba_ssm's selective_scan_cuda.so linked against the OLD ABI → ImportError
+# (undefined symbol c10_cuda_check_implementation...). Use the notebook image's torch.
+# Fresh local venv: `pip install torch` first, then `pip install -r requirements-kaggle-peft.txt`.
+#
+# torchvision must match that torch (transformers imports it); the notebook reinstalls torchvision
+# from the matching PyTorch CUDA wheel index after this file is installed.
+torchvision
+transformers>=4.45.0
+peft>=0.12.0
+trl>=0.12.0
+datasets
+causal-conv1d
+mamba-ssm
+accelerate
+bitsandbytes
+pandas
+numpy
+scikit-learn
+huggingface_hub
+jinja2

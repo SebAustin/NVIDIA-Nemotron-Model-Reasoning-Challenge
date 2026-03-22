@@ -36,8 +36,10 @@ def run_script(name: str, extra_args: list[str]) -> bool:
         print(f"Skip {name}: not found at {path}")
         return True
     cmd = [sys.executable, path] + extra_args
+    env = os.environ.copy()
+    env["PYTHONPATH"] = PROJECT_ROOT + (os.pathsep + env.get("PYTHONPATH", "")) if env.get("PYTHONPATH") else PROJECT_ROOT
     print(f"\n{'='*60}\nRunning: {' '.join(cmd)}\n{'='*60}")
-    result = subprocess.run(cmd, cwd=PROJECT_ROOT)
+    result = subprocess.run(cmd, cwd=PROJECT_ROOT, env=env)
     if result.returncode != 0:
         print(f"Exiting: {name} failed with code {result.returncode}")
         return False

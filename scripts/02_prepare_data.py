@@ -19,6 +19,7 @@ from transformers import AutoTokenizer
 from scripts.utils.answer_extractor import extract_boxed_answer
 from scripts.utils.cot_generator import build_training_example, generate_cot_with_retries
 from scripts.utils.data_formatter import DEFAULT_SYSTEM_PROMPT
+from scripts.utils.model_utils import local_load_kwargs, resolve_model_path
 from scripts.utils.puzzle_generator import generate_all_synthetic
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -121,7 +122,9 @@ def main() -> None:
 
     os.chdir(PROJECT_ROOT)
 
-    tokenizer = AutoTokenizer.from_pretrained("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", trust_remote_code=True)
+    model_path_raw = os.environ.get("NEMOTRON_MODEL_PATH", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
+    model_path = resolve_model_path(model_path_raw)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, **local_load_kwargs(model_path_raw))
     all_records = []
 
     if not args.synthetic_only:

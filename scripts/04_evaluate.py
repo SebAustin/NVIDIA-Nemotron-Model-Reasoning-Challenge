@@ -23,10 +23,13 @@ except ImportError:
     )
     sys.exit(0)
 
+from scripts.utils.model_utils import local_load_kwargs, resolve_model_path
+
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 LORA_ADAPTER_DIR = os.path.join(PROJECT_ROOT, "lora_adapter")
-MODEL_NAME = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+_MODEL_PATH_RAW = os.environ.get("NEMOTRON_MODEL_PATH", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
+MODEL_NAME = resolve_model_path(_MODEL_PATH_RAW)
 
 
 def load_eval_data():
@@ -50,7 +53,7 @@ def load_eval_data():
 def build_prompts_for_inference(prompts: list[str], system_prompt: str) -> list[str]:
     """Build full prompt (system + user) for each item using chat template."""
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True, **local_load_kwargs(_MODEL_PATH_RAW))
     out = []
     for user_text in prompts:
         messages = [

@@ -1,0 +1,17 @@
+# Local / macOS: EDA, data prep, packaging, download script.
+# Omits mamba-ssm, bitsandbytes, causal-conv1d, unsloth (need Linux+CUDA).
+# Training runs on Kaggle.
+torch>=2.1.0
+torchvision
+transformers>=4.45.0
+peft>=0.12.0
+trl>=0.12.0
+datasets
+accelerate
+pandas
+numpy
+scikit-learn
+anthropic
+huggingface_hub
+jinja2
+kagglehub
