@@ -1,42 +1,28 @@
-"""
-Extract final answer from model output using \\boxed{}.
-Align with competition metric when published.
-"""
+"""Extract \\boxed{} answers and compare to gold using competition metric hook."""
+
+from __future__ import annotations
+
 import re
+from typing import Optional
+
+from scripts.utils.competition_metric import scores as default_scores
+
+_BOXED_PATTERN = re.compile(
+    r"\\boxed\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}",
+    re.DOTALL,
+)
 
 
-def extract_boxed_answer(text: str) -> str | None:
-    """
-    Extract the last \\boxed{...} content from text.
-    Handles nested braces in the content.
-    """
-    if not text or not isinstance(text, str):
+def extract_boxed_answer(text: str) -> Optional[str]:
+    """Return the contents of the last \\boxed{...} in text (supports one nested brace level)."""
+    if not text:
         return None
-    # Match \boxed{...} with possible nested braces
-    pattern = r"\\boxed\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}"
-    matches = re.findall(pattern, text)
-    if matches:
-        return matches[-1].strip()
-    return None
+    matches = _BOXED_PATTERN.findall(text)
+    if not matches:
+        return None
+    return matches[-1].strip()
 
 
-def answers_match(predicted: str | None, ground_truth: str) -> bool:
-    """
-    Compare predicted answer to ground truth: exact string match or
-    numeric match within relative tolerance (1e-6 * |gt|).
-    """
-    if predicted is None:
-        return False
-    pred = predicted.strip()
-    gt = ground_truth.strip()
-    if pred == gt:
-        return True
-    try:
-        pred_val = float(pred)
-        gt_val = float(gt)
-        if gt_val == 0:
-            return pred_val == 0
-        return abs(pred_val - gt_val) <= 1e-6 * abs(gt_val)
-    except (ValueError, TypeError):
-        pass
-    return False
+def answers_match(gold: str, pred: str) -> bool:
+    """Use competition `scores(gold, pred)` if provided elsewhere; else default implementation."""
+    return default_scores(gold, pred)

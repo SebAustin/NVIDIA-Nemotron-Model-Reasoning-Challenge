@@ -1,151 +1,168 @@
-"""
-Phase 4: Evaluate LoRA adapter with vLLM — inference, answer extraction, accuracy by puzzle type.
-Run from project root: python scripts/04_evaluate.py
-Requires vllm (install with pip install -r requirements-vllm.txt on Linux+CUDA).
-"""
-import os
+#!/usr/bin/env python3
+"""Phase 4: Evaluate base+LoRA with vLLM using competition-style decoding."""
+
+from __future__ import annotations
+
+import argparse
+import json
 import sys
+from collections import defaultdict
+from pathlib import Path
 
-# Ensure project root is on path when run from any cwd
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
-try:
-    from vllm import LLM, SamplingParams
-    from vllm.lora.request import LoRARequest
-except ImportError:
-    print(
-        "Skipping evaluation: vLLM is not installed. vLLM only supports Linux with an NVIDIA GPU;\n"
-        "it does not install on macOS. To evaluate, run this script on Kaggle (with GPU) or a\n"
-        "Linux+NVIDIA machine after: pip install -r requirements-vllm.txt\n"
-        "Continuing without evaluation (exit 0)."
+import pandas as pd
+from tqdm import tqdm
+from transformers import AutoTokenizer
+
+from scripts.utils.answer_extractor import answers_match, extract_boxed_answer
+from scripts.utils.data_formatter import DEFAULT_SYSTEM_PROMPT
+
+MODEL_ID = "nvidia/Nemotron-3-Nano-30B-A3B-BF16"
+
+
+def _classify_local(prompt: str) -> str:
+    import re
+
+    if not isinstance(prompt, str):
+        return "other"
+    t = prompt.lower()
+    if re.search(r"\b(bit|binary|8-?bit|nibble|xor|rotate|complement)\b", t):
+        return "bit_manipulation"
+    if re.search(
+        r"\b(cipher|encrypt|decrypt|caesar|vigen|substitution|substitute)\b",
+        t,
+    ):
+        return "encryption"
+    if re.search(
+        r"\b(equation|polynomial|modulo|algebra|f\(|function|digit sum)\b",
+        t,
+    ):
+        return "algebraic"
+    if re.search(r"\b(sequence|term|next in|arithmetic|geometric|fibonacci)\b", t):
+        return "sequence"
+    return "other"
+
+
+def build_prompt(tokenizer, user_prompt: str, system_prompt: str) -> str:
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
     )
-    sys.exit(0)
-
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-DATA_DIR = os.path.join(PROJECT_ROOT, "data")
-LORA_ADAPTER_DIR = os.path.join(PROJECT_ROOT, "lora_adapter")
-MODEL_NAME = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
-
-
-def load_eval_data():
-    """Load validation data: train_categorized 10% or train.csv slice with answers."""
-    import pandas as pd
-    train_cat = os.path.join(DATA_DIR, "train_categorized.csv")
-    train_csv = os.path.join(DATA_DIR, "train.csv")
-    if os.path.isfile(train_cat):
-        df = pd.read_csv(train_cat)
-    elif os.path.isfile(train_csv):
-        df = pd.read_csv(train_csv)
-    else:
-        return None, None, None
-    # Hold out 10% for eval
-    df = df.sample(frac=0.1, random_state=42)
-    if "answer" not in df.columns:
-        return None, None, None
-    return df["prompt"].tolist(), df["answer"].tolist(), df.get("puzzle_type")
-
-
-def build_prompts_for_inference(prompts: list[str], system_prompt: str) -> list[str]:
-    """Build full prompt (system + user) for each item using chat template."""
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    out = []
-    for user_text in prompts:
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_text},
-        ]
-        full = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        out.append(full)
-    return out
 
 
 def main() -> None:
-    os.chdir(PROJECT_ROOT)
-    if not os.path.isdir(LORA_ADAPTER_DIR):
-        print(f"Error: {LORA_ADAPTER_DIR} not found. Run 03_train_lora.py first.")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="vLLM eval with LoRA")
+    parser.add_argument("--adapter-path", type=Path, default=Path("lora_adapter"))
+    parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    parser.add_argument(
+        "--train-categorized",
+        type=Path,
+        default=None,
+        help="Default: <data-dir>/train_categorized.csv",
+    )
+    parser.add_argument("--val-fraction", type=float, default=0.1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max-samples", type=int, default=0, help="0 = all")
+    parser.add_argument("--report-dir", type=Path, default=Path("data/reports"))
+    parser.add_argument("--lora-name", type=str, default="reasoning_adapter")
+    parser.add_argument("--lora-id", type=int, default=1)
+    args = parser.parse_args()
 
-    from scripts.utils.answer_extractor import answers_match, extract_boxed_answer
-    from scripts.utils.data_formatter import DEFAULT_SYSTEM_PROMPT
+    try:
+        from vllm import LLM, SamplingParams
+        from vllm.lora.request import LoRARequest
+    except ImportError as e:
+        raise SystemExit(
+            "vLLM is not installed. Use requirements-vllm.txt in an inference env."
+        ) from e
 
-    prompts, ground_truths, puzzle_types = load_eval_data()
-    if prompts is None or not prompts:
-        print("No evaluation data (train.csv or train_categorized.csv with answer column).")
-        sys.exit(1)
+    train_path = args.train_categorized or (args.data_dir / "train_categorized.csv")
+    if not train_path.is_file():
+        train_path = args.data_dir / "train.csv"
+    if not train_path.is_file():
+        raise SystemExit(f"No training CSV at {train_path}")
+    df = pd.read_csv(train_path)
+    if "prompt" not in df.columns or "answer" not in df.columns:
+        raise SystemExit("CSV must include columns 'prompt' and 'answer'")
+    if "puzzle_type" not in df.columns:
+        df["puzzle_type"] = df["prompt"].map(_classify_local)
 
-    print("Building inference prompts...")
-    full_prompts = build_prompts_for_inference(prompts, DEFAULT_SYSTEM_PROMPT)
+    df = df.sample(frac=1.0, random_state=args.seed).reset_index(drop=True)
+    n_val = max(1, int(len(df) * args.val_fraction))
+    val_df = df.head(n_val)
+    if args.max_samples > 0:
+        val_df = val_df.head(args.max_samples)
 
-    print("Loading vLLM with LoRA...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+    prompts = [
+        build_prompt(tokenizer, str(r.prompt), DEFAULT_SYSTEM_PROMPT)
+        for r in val_df.itertuples(index=False)
+    ]
+
     llm = LLM(
-        model=MODEL_NAME,
+        model=MODEL_ID,
         enable_lora=True,
         max_lora_rank=32,
         max_model_len=8192,
         gpu_memory_utilization=0.85,
         max_num_seqs=64,
         dtype="bfloat16",
+        trust_remote_code=True,
     )
-    sampling_params = SamplingParams(
-        temperature=0.0,
-        top_p=1.0,
-        max_tokens=7680,
-    )
-    lora_request = LoRARequest("reasoning_adapter", 1, LORA_ADAPTER_DIR)
+    sampling = SamplingParams(temperature=0.0, top_p=1.0, max_tokens=7680)
+    lora_req = LoRARequest(args.lora_name, args.lora_id, str(args.adapter_path.resolve()))
 
-    print("Running inference...")
-    outputs = llm.generate(
-        full_prompts,
-        sampling_params,
-        lora_request=lora_request,
-    )
-    completions = [o.outputs[0].text for o in outputs]
+    outputs = llm.generate(prompts, sampling, lora_request=lora_req)
 
-    # Extract answers and score
-    extracted = [extract_boxed_answer(c) for c in completions]
-    correct = [answers_match(ex, gt) for ex, gt in zip(extracted, ground_truths)]
-    accuracy = sum(correct) / len(correct) if correct else 0.0
-    print(f"\nOverall accuracy: {accuracy:.2%} ({sum(correct)}/{len(correct)})")
+    correct = 0
+    by_type: dict[str, list[bool]] = defaultdict(list)
+    errors: list[dict] = []
 
-    by_type = {}
-    if puzzle_types is not None and len(puzzle_types) == len(correct):
-        from collections import defaultdict
-        by_type = defaultdict(lambda: {"correct": 0, "total": 0})
-        for pt, c in zip(puzzle_types, correct):
-            by_type[pt]["total"] += 1
-            if c:
-                by_type[pt]["correct"] += 1
-        print("\nAccuracy by puzzle type:")
-        for pt in sorted(by_type.keys()):
-            t = by_type[pt]
-            acc = t["correct"] / t["total"] if t["total"] else 0
-            print(f"  {pt}: {acc:.2%} ({t['correct']}/{t['total']})")
+    for row, out in tqdm(
+        zip(val_df.itertuples(index=False), outputs),
+        total=len(val_df),
+        desc="Eval",
+    ):
+        text = out.outputs[0].text
+        pred = extract_boxed_answer(text)
+        gold = str(getattr(row, "answer")).strip()
+        ok = pred is not None and answers_match(gold, pred)
+        if ok:
+            correct += 1
+        ptype = getattr(row, "puzzle_type", "other")
+        by_type[str(ptype)].append(ok)
+        if not ok:
+            errors.append(
+                {
+                    "id": str(getattr(row, "id", "")),
+                    "puzzle_type": str(ptype),
+                    "gold": gold,
+                    "pred": pred,
+                    "completion_preview": text[:2000],
+                }
+            )
 
-    # Failure examples
-    failures = [(i, extracted[i], ground_truths[i], completions[i][:500]) for i in range(len(correct)) if not correct[i]]
-    print(f"\nFailure examples (first 5):")
-    for i, (idx, ex, gt, preview) in enumerate(failures[:5]):
-        print(f"  [{i+1}] extracted={ex!r}  ground_truth={gt!r}")
-        print(f"      completion preview: {preview!r}...")
+    total = len(val_df)
+    acc = correct / total if total else 0.0
+    print(f"Accuracy: {acc:.4f} ({correct}/{total})")
+    for ptype, flags in sorted(by_type.items()):
+        c = sum(1 for x in flags if x)
+        print(f"  {ptype}: {c}/{len(flags)} = {c/len(flags):.4f}")
 
-    # Optional: write report
-    report_path = os.path.join(PROJECT_ROOT, "eval_report.txt")
-    with open(report_path, "w") as f:
-        f.write(f"Overall accuracy: {accuracy:.2%}\n")
-        if by_type:
-            for pt in sorted(by_type.keys()):
-                t = by_type[pt]
-                acc = t["correct"] / t["total"] if t["total"] else 0
-                f.write(f"  {pt}: {acc:.2%}\n")
-        f.write("\nFailure sample:\n")
-        for idx, ex, gt, _ in failures[:10]:
-            f.write(f"  extracted={ex!r}  gt={gt!r}\n")
-    print(f"\nReport written to {report_path}")
+    args.report_dir.mkdir(parents=True, exist_ok=True)
+    err_path = args.report_dir / "eval_errors.jsonl"
+    with err_path.open("w", encoding="utf-8") as f:
+        for e in errors:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+    print(f"Wrote error cases: {err_path}")
 
 
 if __name__ == "__main__":

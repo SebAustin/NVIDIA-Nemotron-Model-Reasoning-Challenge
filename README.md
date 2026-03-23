@@ -1,102 +1,70 @@
-# NVIDIA Nemotron Reasoning Challenge
+# NVIDIA Nemotron Model Reasoning Challenge
 
-Pipeline for the [NVIDIA Nemotron Model Reasoning Challenge](https://www.kaggle.com/competitions/nvidia-nemotron-model-reasoning-challenge/) on Kaggle: train a LoRA adapter (rank ≤ 32) for **Nemotron-3-Nano-30B-A3B-BF16** to maximize accuracy on logical reasoning puzzles.
+Pipeline: EDA → supervised data (CoT + synthetic) → QLoRA SFT → vLLM eval → `submission.zip`.
 
-## Clone and run (from GitHub)
+## Setup
+
+1. Place Kaggle files as `data/train.csv` and `data/test.csv`.
+2. (Optional) Copy the competition **public metric** into `scripts/utils/competition_metric.py` with a function `scores(gold: str, pred: str) -> bool` so evaluation matches the leaderboard exactly.
+3. Python **3.10–3.12** recommended (3.14 is often missing prebuilt wheels; more builds from source).
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/nemotron-reasoning-challenge.git
-cd nemotron-reasoning-challenge
-bash setup_venv.sh
+./setup_venv.sh
+# or: python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
 source .venv/bin/activate
-# Add train.csv and test.csv to data/ (from Kaggle), then:
-python run_all.py --skip-train --skip-eval   # local (no GPU)
-# Or run full pipeline on Kaggle via kaggle_notebook.ipynb (set GITHUB_REPO to this repo).
 ```
 
-## Kaggle notebook
+For vLLM evaluation only, use a separate env with `requirements-vllm.txt` if needed.
 
-Use **`kaggle_notebook.ipynb`** to run the full pipeline on Kaggle and produce `submission.zip`.
+**macOS / Apple Silicon:** `requirements.txt` is enough for **EDA + data prep** (`01_eda.py`, `02_prepare_data.py`). Do **not** `pip install causal-conv1d` / `mamba-ssm` on Mac unless you have a working CUDA or vendor-specific setup — builds usually fail (`nvcc` missing, or `NameError: bare_metal_version` in `causal-conv1d`). For **Nemotron training**, use **Kaggle GPU** and `requirements-mamba.txt` there.
 
-**Input dataset:** Add the **competition dataset** to the notebook (via “Add Data” on the [NVIDIA Nemotron Model Reasoning Challenge](https://www.kaggle.com/competitions/nvidia-nemotron-model-reasoning-challenge) page). It must include **train.csv** (columns: `id`, `prompt`, `answer`) and **test.csv** (columns: `id`, `prompt`). You also need to provide the project code: either set `GITHUB_REPO` to a public repo URL (and enable Internet), or add a Kaggle Dataset that contains this project (e.g. a zip with `scripts/`, `run_all.py`, `requirements.txt`). See the notebook’s first cell for details.
+## Environment variables
 
-## Setup (one-time)
+| Variable | Used by |
+|----------|---------|
+| `NEMOTRON_MAX_MEMORY_CPU` | `03_train_lora.py` auto `max_memory` host-RAM cap (e.g. `8GiB`) if SIGKILL during load |
+| `ANTHROPIC_API_KEY` | `02_prepare_data.py` when `--cot-backend anthropic` |
+| `OPENAI_API_KEY` | `02_prepare_data.py` when `--cot-backend openai` |
+| `OPENAI_BASE_URL` | Optional OpenAI-compatible base URL |
+| `WANDB_API_KEY` | Training logs when `USE_WANDB=1` |
 
-Create a virtual environment and install dependencies:
+## Run order
 
 ```bash
-# From project root
-bash setup_venv.sh
-source .venv/bin/activate   # or: .venv\Scripts\activate on Windows
+python scripts/01_eda.py --data-dir data --report-dir data/reports
+python scripts/02_prepare_data.py --data-dir data --skip-cot  # or configure API for full CoT
+python scripts/03_train_lora.py --data-path data/train_sft.jsonl --output-dir lora_adapter
+python scripts/04_evaluate.py --adapter-path lora_adapter --data-dir data
+python scripts/05_package_submission.py --adapter-dir lora_adapter
 ```
 
-Use a different Python or venv path: `PYTHON=python3.11 VENV_DIR=./myenv bash setup_venv.sh`
+On Kaggle (after `kagglehub.model_download`), prefer: `--model-path <cache> --no-quant --lora-target-mode kaggle_nemotron --lora-alpha 16 --force-peft` (see **Kaggle** section).
 
-**vLLM (Phase 4 evaluation only):** vLLM is not in the default requirements because it often fails to build from source on macOS or without CUDA. On a **Linux machine with NVIDIA GPU and CUDA**, install it after the main requirements:
+Use `--help` on each script for options.
+
+## Kaggle
+
+Use [`kaggle_workflow.ipynb`](kaggle_workflow.ipynb) on a GPU notebook. **Re-upload your Kaggle code dataset whenever `scripts/` changes** (an old `02_prepare_data.py` only understands flags like `--synthetic-only` / `--bit` and will reject `--data-dir`). The current `02_prepare_data.py` supports both styles: full flags (`--data-dir`, `--tokenizer-model`, `--synthetic-per-kind`, …) and aliases (`--synthetic-only` → `--skip-cot`, `--max-cot` → `--limit-train`, per-type `--bit` / `--cipher` / `--algebraic` / `--sequence`).
+
+Defaults in the notebook config point at a scripts dataset and at `/kaggle/input/competitions/nvidia-nemotron-model-reasoning-challenge/` for `train.csv` (adjust paths if your mounts differ). Base weights load via competition mount and/or `kagglehub` (`metric/nemotron-3-nano-30b-a3b-bf16/transformers/default`). Training uses **`transformers>=4.45,<5`** (v5 can OOM loading 4-bit on 16GB GPUs), **`--lora-target-mode kaggle_nemotron`** (alpha 16), and **4-bit QLoRA** on T4 (`USE_BF16_FULL = False`).
+
+**Mamba dependency:** loading the full Nemotron checkpoint requires **`mamba-ssm`** and **`causal-conv1d`** (the `kaggle_workflow.ipynb` pip cell installs them). If pip fails to build wheels, align versions with the official competition starter notebook (`import mamba_ssm`).
+
+**Offline wheel datasets (optional):** You can attach a dataset of `.whl` files (e.g. [dennisfong/nvidia-nemotron-offline-packages](https://www.kaggle.com/datasets/dennisfong/nvidia-nemotron-offline-packages)), then install from the mount instead of PyPI. After adding it, check the exact path under **`/kaggle/input/`** (Kaggle rewrites the folder name). Example pattern:
 
 ```bash
-pip install -r requirements-vllm.txt
+WHEELS=/kaggle/input/<folder-from-inputs-tab>   # e.g. nvidia-nemotron-offline-packages
+pip install --no-index --find-links="file://$WHEELS" <package-names...>
 ```
 
-If that fails (no matching pre-built wheel), try: `pip install vllm --pre --extra-index-url https://wheels.vllm.ai/nightly`. You can skip Phase 4 locally and run evaluation on Kaggle or a cloud GPU instead.
+Still enforce this repo’s constraints where they matter (**`transformers>=4.45,<5`**, compatible **`torch`** with Kaggle’s CUDA). If the bundle is missing a dependency (e.g. `polars`, `kagglehub`), fall back to `pip install` for those only.
 
-## Prerequisites
+**MoE + `device_map="auto"`:** bf16 loads may spill weights to disk; `03_train_lora.py` passes an absolute **`offload_folder`** (and logs a `build=` line). Re-sync scripts if that line is missing. **TRL:** recent `SFTConfig` uses **`max_length`** instead of **`max_seq_length`**; the training script adapts via `inspect` so multiple TRL versions work.
 
-1. **Competition data**: Download `train.csv` and `test.csv` from Kaggle into `data/`.
-2. **CoT generation** (Phase 2): Set `ANTHROPIC_API_KEY` (or configure another API) for chain-of-thought generation.
-3. **GPU**: Training and vLLM evaluation require a GPU (e.g. ~24GB VRAM for 4-bit LoRA).
+**T4 / ~15GB VRAM:** do **not** use **`--no-quant`** + long context — you will OOM. Use **4-bit QLoRA** (`USE_BF16_FULL = False`) and **`--max-seq-length`** around **2048**. If the weight bar reaches ~25% then OOMs, you likely have **transformers 5.x**; pin **`<5`** in the pip cell. **`SIGKILL` / exit code -9** during “Loading checkpoint shards” is usually **host RAM**: do not set **`cpu` to hundreds of GiB** in `max_memory` on Kaggle; `03_train_lora.py` now caps auto **`cpu`** from real RAM (override with env **`NEMOTRON_MAX_MEMORY_CPU`** e.g. `8GiB` if needed). For **2× T4** with bf16, optional `'{"0":"13GiB","1":"13GiB","cpu":"12GiB","disk":"120GiB"}'`.
 
-## Project layout
+## Notes
 
-```
-data/                 # train.csv, test.csv, train_categorized.csv, train_sft.jsonl, synthetic/
-scripts/
-  01_eda.py           # EDA and puzzle-type categorization
-  02_prepare_data.py  # CoT generation + synthetic data → train_sft.jsonl
-  03_train_lora.py    # LoRA SFT (and optional GRPO)
-  04_evaluate.py      # vLLM evaluation and error analysis
-  05_package_submission.py
-  utils/
-    answer_extractor.py
-    cot_generator.py
-    data_formatter.py
-    puzzle_generator.py
-lora_output/          # Training checkpoints
-lora_adapter/         # Final adapter for submission
-submission.zip        # Packaged submission
-```
-
-## Usage
-
-**Run the full pipeline** (with venv activated):
-
-```bash
-python run_all.py
-```
-
-Options: `--skip-eda`, `--skip-prepare`, `--synthetic-only`, `--skip-train`, `--skip-eval`, `--skip-package`, `--max-cot N`. Example: synthetic-only data then skip training/eval:
-
-```bash
-python run_all.py --synthetic-only --skip-train --skip-eval
-```
-
-**Or run steps individually:**
-
-1. **EDA**: `python scripts/01_eda.py` (requires `data/train.csv`, `data/test.csv`).
-2. **Prepare data**: `python scripts/02_prepare_data.py` (produces `data/train_sft.jsonl`).
-3. **Train**: `python scripts/03_train_lora.py` (writes `lora_adapter/`).
-4. **Evaluate**: `python scripts/04_evaluate.py`.
-5. **Package**: `python scripts/05_package_submission.py` → `submission.zip`.
-
-## Iteration (after first submission)
-
-- Weak puzzle type → add more synthetic data for that type and retrain.
-- Format errors (missing `\boxed{}`) → add format-focused examples or GRPO with format penalty.
-- Overfitting → fewer epochs, more dropout, more diverse data.
-- Run GRPO (Stage 2) in `03_train_lora.py` after SFT baseline.
-
-## Pushing this repo to GitHub
-
-- Do **not** commit `data/train.csv`, `data/test.csv`, or generated data (they are in `.gitignore`). Download them from Kaggle after cloning.
-- Do **not** commit `.venv/`, `lora_adapter/`, or `submission.zip` (ignored).
-- From the project root: `git init`, `git add .`, `git commit -m "Initial commit"`, then add your remote and push.
+- Base model: `nvidia/Nemotron-3-Nano-30B-A3B-BF16` (LoRA rank ≤ 32).
+- Training uses Unsloth when import succeeds (HF id + 4-bit); otherwise PEFT. Use `--no-quant` for full bf16 weights (e.g. Kaggle Hub cache).
+- `02_prepare_data.py` can generate synthetic-only data with `--skip-cot` for a quick baseline without API calls.

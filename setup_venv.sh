@@ -1,25 +1,17 @@
 #!/usr/bin/env bash
-# Create a Python virtual environment and install all dependencies for the Nemotron Reasoning Challenge.
-# Run from project root: ./setup_venv.sh   or   bash setup_venv.sh
-
-set -e
+set -euo pipefail
 cd "$(dirname "$0")"
 
-VENV_DIR="${VENV_DIR:-.venv}"
-PYTHON="${PYTHON:-python3}"
+python3 -m venv .venv
+.venv/bin/pip install -U pip setuptools wheel
+.venv/bin/pip install -r requirements.txt
 
-echo "Using Python: $(which $PYTHON)"
-$PYTHON --version
-
-echo "Creating virtual environment at $VENV_DIR ..."
-$PYTHON -m venv "$VENV_DIR"
-
-echo "Activating and upgrading pip ..."
-# shellcheck source=/dev/null
-source "$VENV_DIR/bin/activate"
-pip install --upgrade pip
-
-echo "Installing requirements ..."
-pip install -r requirements.txt
-
-echo "Done. Activate with: source $VENV_DIR/bin/activate"
+echo ""
+echo "Done. Activate with:"
+echo "  source .venv/bin/activate"
+echo ""
+echo "Optional Unsloth (CUDA/Linux, may fail on macOS):"
+echo "  .venv/bin/pip install -r requirements-unsloth.txt"
+echo ""
+echo "Mamba (Nemotron load / training) — Linux+CUDA only, not typical macOS:"
+echo "  .venv/bin/pip install -r requirements-mamba.txt"

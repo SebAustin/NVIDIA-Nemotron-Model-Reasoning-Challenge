@@ -1,174 +1,191 @@
-"""
-Phase 1: EDA and puzzle-type categorization for Nemotron Reasoning Challenge.
-Run from project root: python scripts/01_eda.py
-"""
-import os
+#!/usr/bin/env python3
+"""Phase 1: EDA for Nemotron Reasoning Challenge train/test CSVs."""
+
+from __future__ import annotations
+
+import argparse
 import re
 import sys
+from collections import Counter
+from pathlib import Path
 
-import pandas as pd
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 import numpy as np
+import pandas as pd
 from transformers import AutoTokenizer
 
-# Paths relative to project root
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-DATA_DIR = os.path.join(PROJECT_ROOT, "data")
-TRAIN_PATH = os.path.join(DATA_DIR, "train.csv")
-TEST_PATH = os.path.join(DATA_DIR, "test.csv")
-OUTPUT_PATH = os.path.join(DATA_DIR, "train_categorized.csv")
-
-# Keyword rules for puzzle-type categorization (order matters: first match wins for ties)
-PUZZLE_TYPE_RULES = [
-    (
-        "bit_manipulation",
-        re.compile(
-            r"\b(bit|binary|8-bit|nibble|XOR|rotate|reverse|shift|complement|mask)\b",
-            re.I,
-        ),
-    ),
-    (
-        "encryption_cipher",
-        re.compile(
-            r"\b(cipher|encrypt|decrypt|Caesar|substitution|decode|encode|Vigenère|Vigenere)\b",
-            re.I,
-        ),
-    ),
-    (
-        "algebraic_numeric",
-        re.compile(
-            r"\b(function|equation|f\(x\)|mod|digit|sum|polynomial|modular|arithmetic)\b",
-            re.I,
-        ),
-    ),
-    (
-        "sequence",
-        re.compile(
-            r"\b(sequence|pattern|next term|series|Fibonacci|arithmetic progression|geometric)\b",
-            re.I,
-        ),
-    ),
-]
+MODEL_ID = "nvidia/Nemotron-3-Nano-30B-A3B-BF16"
 
 
-def categorize_puzzle_type(prompt: str) -> str:
-    """Assign one puzzle type based on keyword counts; default 'other'."""
-    if not isinstance(prompt, str) or not prompt.strip():
+def classify_puzzle_type(prompt: str) -> str:
+    if not isinstance(prompt, str):
         return "other"
-    text = prompt.strip().lower()
-    scores = []
-    for label, pattern in PUZZLE_TYPE_RULES:
-        count = len(pattern.findall(text))
-        scores.append((count, label))
-    scores.sort(reverse=True, key=lambda x: (x[0], x[1]))
-    return scores[0][1] if scores and scores[0][0] > 0 else "other"
+    t = prompt.lower()
+    if re.search(r"\b(bit|binary|8-?bit|nibble|xor|rotate|complement)\b", t):
+        return "bit_manipulation"
+    if re.search(
+        r"\b(cipher|encrypt|decrypt|caesar|vigen|substitution|substitute)\b",
+        t,
+    ):
+        return "encryption"
+    if re.search(
+        r"\b(equation|polynomial|modulo|algebra|f\(|function|digit sum)\b",
+        t,
+    ):
+        return "algebraic"
+    if re.search(r"\b(sequence|term|next in|arithmetic|geometric|fibonacci)\b", t):
+        return "sequence"
+    return "other"
 
 
-def infer_answer_type(answer: str) -> str:
-    """Infer answer type: numeric, binary, string, etc."""
-    if not isinstance(answer, str):
-        return "unknown"
-    s = answer.strip()
-    if not s:
-        return "empty"
-    if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
-        return "numeric"
-    if re.match(r"^[01\s]+$", s) and set(s.replace(" ", "")) <= {"0", "1"}:
-        return "binary"
+def answer_kind(answer: str) -> str:
+    if answer is None or (isinstance(answer, float) and np.isnan(answer)):
+        return "missing"
+    s = str(answer).strip()
+    if re.fullmatch(r"[01]{8}", s):
+        return "binary_8bit"
+    if re.fullmatch(r"[01]+", s):
+        return "binary_string"
     try:
         float(s)
         return "numeric"
     except ValueError:
         pass
-    return "string"
+    if len(s) <= 32:
+        return "short_text"
+    return "long_text"
+
+
+def token_lengths(tokenizer, texts: list[str]) -> list[int]:
+    out: list[int] = []
+    for text in texts:
+        if not isinstance(text, str):
+            text = str(text)
+        ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+        out.append(len(ids))
+    return out
 
 
 def main() -> None:
-    os.chdir(PROJECT_ROOT)
-    if not os.path.isfile(TRAIN_PATH):
-        print(f"Error: {TRAIN_PATH} not found. Download train.csv from Kaggle into data/.")
-        sys.exit(1)
-    if not os.path.isfile(TEST_PATH):
-        print(f"Error: {TEST_PATH} not found. Download test.csv from Kaggle into data/.")
-        sys.exit(1)
-
-    print("Loading data...")
-    train = pd.read_csv(TRAIN_PATH)
-    test = pd.read_csv(TEST_PATH)
-    print(f"Train: {len(train)} rows. Test: {len(test)} rows.")
-    print(f"Train columns: {list(train.columns)}")
-    print(f"Test columns: {list(test.columns)}")
-
-    # Categorize
-    print("\nCategorizing puzzle types...")
-    train["puzzle_type"] = train["prompt"].apply(categorize_puzzle_type)
-    test["puzzle_type"] = test["prompt"].apply(categorize_puzzle_type)
-
-    # Tokenizer
-    print("Loading Nemotron tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
-    train["prompt_tokens"] = train["prompt"].apply(
-        lambda x: len(tokenizer.encode(x, add_special_tokens=False)) if isinstance(x, str) else 0
+    parser = argparse.ArgumentParser(description="EDA for train/test CSVs")
+    parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    parser.add_argument(
+        "--output-categorized",
+        type=Path,
+        default=None,
+        help="Default: <data-dir>/train_categorized.csv",
     )
-    test["prompt_tokens"] = test["prompt"].apply(
-        lambda x: len(tokenizer.encode(x, add_special_tokens=False)) if isinstance(x, str) else 0
+    parser.add_argument("--report-dir", type=Path, default=Path("data/reports"))
+    parser.add_argument("--tokenizer-model", type=str, default=MODEL_ID)
+    parser.add_argument(
+        "--assistant-budgets",
+        type=int,
+        nargs="*",
+        default=[2048, 4096],
+        help="Token budgets to add to prompt length for length warnings",
+    )
+    args = parser.parse_args()
+    data_dir = args.data_dir
+    report_dir = args.report_dir
+    report_dir.mkdir(parents=True, exist_ok=True)
+    out_cat = args.output_categorized or (data_dir / "train_categorized.csv")
+
+    train_path = data_dir / "train.csv"
+    test_path = data_dir / "test.csv"
+    if not train_path.is_file():
+        raise SystemExit(f"Missing {train_path}")
+    train = pd.read_csv(train_path)
+    if "prompt" not in train.columns:
+        raise SystemExit("train.csv must contain column 'prompt'")
+    if "answer" not in train.columns:
+        raise SystemExit("train.csv must contain column 'answer'")
+
+    test = None
+    if test_path.is_file():
+        test = pd.read_csv(test_path)
+        if "prompt" not in test.columns:
+            raise SystemExit("test.csv must contain column 'prompt'")
+
+    train["puzzle_type"] = train["prompt"].map(classify_puzzle_type)
+    train.to_csv(out_cat, index=False)
+    print(f"Wrote categorized train: {out_cat}")
+
+    type_counts = Counter(train["puzzle_type"])
+    answer_kinds = train["answer"].map(answer_kind)
+    kind_counts = Counter(answer_kinds)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.tokenizer_model,
+        trust_remote_code=True,
+    )
+    train_prompt_lens = token_lengths(tokenizer, train["prompt"].tolist())
+    train["prompt_tokens"] = train_prompt_lens
+
+    lines: list[str] = []
+    lines.append("# Nemotron Reasoning — EDA report\n")
+    lines.append("## Puzzle pattern\n")
+    lines.append(
+        "Each prompt typically lists several input→output examples that illustrate a hidden "
+        "rule, then asks for the output on a new input (few-shot rule induction).\n"
+    )
+    lines.append("## Puzzle type distribution (train)\n")
+    for k, v in sorted(type_counts.items(), key=lambda x: -x[1]):
+        lines.append(f"- {k}: {v}\n")
+    lines.append("\n## Answer kind distribution (train)\n")
+    for k, v in sorted(kind_counts.items(), key=lambda x: -x[1]):
+        lines.append(f"- {k}: {v}\n")
+
+    pt = np.array(train_prompt_lens)
+    lines.append("\n## Prompt token length (train, tokenizer)\n")
+    lines.append(f"- min: {pt.min()}, max: {pt.max()}, mean: {pt.mean():.1f}, median: {np.median(pt):.1f}\n")
+
+    alens = train["answer"].astype(str).str.len()
+    lines.append("\n## Answer character length (train)\n")
+    lines.append(
+        f"- min: {alens.min()}, max: {alens.max()}, mean: {alens.mean():.1f}\n"
     )
 
-    # Answer type and length (train only)
-    train["answer_type"] = train["answer"].apply(infer_answer_type)
-    train["answer_len_chars"] = train["answer"].astype(str).str.len()
-    train["answer_len_tokens"] = train["answer"].apply(
-        lambda x: len(tokenizer.encode(str(x), add_special_tokens=False))
+    system_stub = (
+        "You are an expert logical reasoning assistant. [...] \\boxed{}."
     )
-
-    # Distributions
-    print("\n--- Puzzle type distribution (train) ---")
-    print(train["puzzle_type"].value_counts())
-    print("\n--- Puzzle type distribution (test) ---")
-    print(test["puzzle_type"].value_counts())
-
-    print("\n--- Prompt length (tokens) ---")
-    for df, name in [(train, "train"), (test, "test")]:
-        t = df["prompt_tokens"]
-        print(f"{name}: min={t.min()}, max={t.max()}, median={t.median():.0f}, mean={t.mean():.0f}")
-        over = (t >= 8192).sum()
-        near = ((t >= 7000) & (t < 8192)).sum()
-        print(f"  Over 8192: {over}, in [7000, 8192): {near}")
-
-    print("\n--- Answer type (train) ---")
-    print(train["answer_type"].value_counts())
-    print("\n--- Answer length (train) ---")
-    print(f"Chars: min={train['answer_len_chars'].min()}, max={train['answer_len_chars'].max()}")
-    print(f"Tokens: min={train['answer_len_tokens'].min()}, max={train['answer_len_tokens'].max()}")
-
-    # Examples per type
-    print("\n--- Example prompts and answers (2 per type) ---")
-    for ptype in train["puzzle_type"].unique():
-        subset = train[train["puzzle_type"] == ptype].head(2)
-        print(f"\n[{ptype}]")
-        for _, row in subset.iterrows():
-            prompt_preview = (row["prompt"] or "")[:300] + "..." if len(str(row["prompt"] or "")) > 300 else (row["prompt"] or "")
-            print(f"  Answer: {row['answer']}")
-            print(f"  Prompt: {prompt_preview}\n")
-
-    # Pattern summary
-    print("\n--- Pattern summary ---")
-    print(
-        "Each prompt contains several input→output examples demonstrating a hidden rule, "
-        "then asks the model to apply that rule to a new input. The model must place the "
-        "final answer inside \\boxed{}."
+    sys_tok = len(
+        tokenizer(system_stub, add_special_tokens=False)["input_ids"]
     )
+    lines.append("\n## Length vs max_model_len=8192 (rough)\n")
+    lines.append(
+        f"- Approx system stub tokens: {sys_tok} (replace with real template for production).\n"
+    )
+    for budget in args.assistant_budgets:
+        total = np.array(train_prompt_lens) + sys_tok + budget
+        over = (total > 8192).sum()
+        lines.append(
+            f"- prompt + system + assistant_budget={budget}: rows over 8192 tokens: {over} / {len(train)}\n"
+        )
 
-    # Length vs max_model_len
-    system_tokens = 100
-    cot_tokens = 2000
-    train["est_total_tokens"] = train["prompt_tokens"] + system_tokens + cot_tokens
-    over_est = (train["est_total_tokens"] > 8192).sum()
-    print(f"\n--- Estimated total (prompt + {system_tokens} system + {cot_tokens} CoT) ---")
-    print(f"Examples with est. total > 8192: {over_est} / {len(train)}")
+    lines.append("\n## Sample prompts by type (2–3 each)\n")
+    for ptype in sorted(type_counts.keys()):
+        sub = train[train["puzzle_type"] == ptype].head(3)
+        lines.append(f"\n### {ptype}\n")
+        for _, row in sub.iterrows():
+            pid = row.get("id", "")
+            lines.append(f"- id={pid}\n")
+            pr = str(row["prompt"])
+            preview = pr[:800] + ("…" if len(pr) > 800 else "")
+            lines.append(f"  prompt preview:\n```\n{preview}\n```\n")
+            lines.append(f"  answer: {row.get('answer', '')!r}\n")
 
-    # Save
-    train.to_csv(OUTPUT_PATH, index=False)
-    print(f"\nSaved: {OUTPUT_PATH}")
+    if test is not None:
+        test_lens = token_lengths(tokenizer, test["prompt"].tolist())
+        tt = np.array(test_lens)
+        lines.append("\n## Test prompt token lengths\n")
+        lines.append(f"- min: {tt.min()}, max: {tt.max()}, mean: {tt.mean():.1f}\n")
+
+    report_path = report_dir / "eda_report.md"
+    report_path.write_text("".join(lines), encoding="utf-8")
+    print(f"Wrote report: {report_path}")
 
 
 if __name__ == "__main__":

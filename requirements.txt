@@ -1,16 +1,16 @@
+# Training stack (PEFT / Unsloth path). Pin versions after validating on your GPU image.
 torch>=2.1.0
-transformers>=4.45.0
+# transformers 5.x: BitsAndBytes load can OOM on 16GB GPUs (weights materialize FP on GPU before quant).
+transformers>=4.45.0,<5.0.0
 peft>=0.12.0
 trl>=0.12.0
 datasets
-# vllm: install separately for Phase 4 (eval). Use requirements-vllm.txt on Linux+CUDA.
-unsloth
+psutil
 accelerate
 bitsandbytes
 pandas
 numpy
 wandb
 scikit-learn
-anthropic
-huggingface_hub
-jinja2
+tqdm
+# Unsloth is optional (GPU/Linux-friendly). See requirements-unsloth.txt — omit on macOS if xformers fails.

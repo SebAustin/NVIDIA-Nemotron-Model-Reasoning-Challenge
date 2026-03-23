@@ -1,82 +1,140 @@
-"""
-Generate chain-of-thought reasoning traces via an external API (e.g. Claude).
-Uses ANTHROPIC_API_KEY from environment; no keys in code.
-"""
+"""Generate chain-of-thought completions via Anthropic or OpenAI-compatible APIs."""
+
+from __future__ import annotations
+
+import json
 import os
-from typing import Callable
+import ssl
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from typing import List, Literal, Optional, Tuple
 
 from scripts.utils.answer_extractor import answers_match, extract_boxed_answer
 from scripts.utils.data_formatter import DEFAULT_SYSTEM_PROMPT
 
-
-def call_anthropic(system: str, user: str, max_tokens: int = 4096, temperature: float = 0.0) -> str:
-    """Call Anthropic API. Requires ANTHROPIC_API_KEY in env."""
-    try:
-        import anthropic
-    except ImportError:
-        raise ImportError("Install anthropic: pip install anthropic")
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
-        raise ValueError("ANTHROPIC_API_KEY not set")
-    client = anthropic.Anthropic(api_key=key)
-    msg = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=max_tokens,
-        temperature=temperature,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-    )
-    text = msg.content[0].text if msg.content else ""
-    return text
+Backend = Literal["anthropic", "openai"]
 
 
-def generate_cot_with_retries(
-    puzzle_prompt: str,
-    ground_truth_answer: str,
-    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
-    call_model: Callable[[str, str], str] | None = None,
-    max_retries: int = 3,
-) -> tuple[str | None, bool]:
-    """
-    Generate CoT for one puzzle. Returns (assistant_content, correct).
-    assistant_content includes CoT and final \\boxed{answer}.
-    If no call_model is provided, uses call_anthropic.
-    """
-    if call_model is None:
-        call_model = lambda sys, user: call_anthropic(sys, user)
-    user_content = puzzle_prompt.strip()
-    for attempt in range(max_retries):
-        try:
-            raw = call_model(system_prompt, user_content)
-        except Exception as e:
-            if attempt == max_retries - 1:
-                return None, False
-            continue
-        extracted = extract_boxed_answer(raw)
-        if answers_match(extracted, ground_truth_answer):
-            # Normalize to end with \boxed{answer}
-            if extracted is not None and not raw.strip().endswith("}"):
-                if "\\boxed{" in raw:
-                    raw = raw.strip()
-                    if not raw.endswith("}"):
-                        raw = raw + "\n\n\\boxed{" + extracted + "}"
-                else:
-                    raw = raw.strip() + "\n\n\\boxed{" + extracted + "}"
-            return raw.strip(), True
-    return None, False
+@dataclass
+class CoTResult:
+    raw_text: str
+    extracted: Optional[str]
 
 
-def build_training_example(
-    puzzle_prompt: str,
-    ground_truth_answer: str,
-    assistant_content: str,
-    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
-) -> dict:
-    """Build one JSONL training example with messages key."""
-    return {
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": puzzle_prompt.strip()},
-            {"role": "assistant", "content": assistant_content},
-        ]
+def _post_json(url: str, headers: dict, payload: dict, timeout: int = 120) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    ctx = ssl.create_default_context()
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+        body = resp.read().decode("utf-8")
+    return json.loads(body)
+
+
+def _anthropic_complete(
+    model: str,
+    api_key: str,
+    system: str,
+    user: str,
+    max_tokens: int,
+    temperature: float,
+) -> str:
+    url = "https://api.anthropic.com/v1/messages"
+    headers = {
+        "content-type": "application/json",
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
     }
+    payload = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "system": system,
+        "messages": [{"role": "user", "content": user}],
+    }
+    out = _post_json(url, headers, payload)
+    parts = out.get("content") or []
+    texts = [p.get("text", "") for p in parts if p.get("type") == "text"]
+    return "".join(texts).strip()
+
+
+def _openai_complete(
+    base_url: str,
+    model: str,
+    api_key: str,
+    system: str,
+    user: str,
+    max_tokens: int,
+    temperature: float,
+) -> str:
+    base = base_url.rstrip("/")
+    url = f"{base}/chat/completions"
+    headers = {
+        "content-type": "application/json",
+        "authorization": f"Bearer {api_key}",
+    }
+    payload = {
+        "model": model,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+    out = _post_json(url, headers, payload)
+    choice = (out.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    return (msg.get("content") or "").strip()
+
+
+def generate_cot_with_verification(
+    user_prompt: str,
+    gold_answer: str,
+    *,
+    backend: Backend,
+    model: str,
+    max_tokens: int = 4096,
+    temperatures: Optional[List[float]] = None,
+    max_attempts: int = 3,
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+) -> CoTResult:
+    """
+    Query teacher model; retry with different temperatures until extracted answer matches gold.
+    Returns model text (may include \\boxed{}) and extracted answer (or None).
+    """
+    temps = temperatures if temperatures is not None else [0.0, 0.3, 0.7]
+    api_key = os.environ.get("ANTHROPIC_API_KEY" if backend == "anthropic" else "OPENAI_API_KEY", "")
+    if not api_key:
+        raise RuntimeError(
+            f"Missing {'ANTHROPIC_API_KEY' if backend == 'anthropic' else 'OPENAI_API_KEY'}"
+        )
+    base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    user_instr = (
+        user_prompt
+        + "\n\nAfter reasoning, end with the final answer inside \\boxed{} exactly once."
+    )
+    last_text = ""
+    for attempt in range(min(max_attempts, len(temps))):
+        t = temps[attempt]
+        try:
+            if backend == "anthropic":
+                last_text = _anthropic_complete(
+                    model, api_key, system_prompt, user_instr, max_tokens, t
+                )
+            else:
+                last_text = _openai_complete(
+                    base_url, model, api_key, system_prompt, user_instr, max_tokens, t
+                )
+        except urllib.error.HTTPError as e:
+            err = e.read().decode("utf-8", errors="replace")
+            last_text = f"[HTTPError {e.code}] {err}"
+            continue
+        except Exception as e:
+            last_text = f"[Error] {e!r}"
+            continue
+        extracted = extract_boxed_answer(last_text)
+        if extracted is not None and answers_match(gold_answer, extracted):
+            return CoTResult(raw_text=last_text, extracted=extracted)
+    extracted = extract_boxed_answer(last_text)
+    return CoTResult(raw_text=last_text, extracted=extracted)

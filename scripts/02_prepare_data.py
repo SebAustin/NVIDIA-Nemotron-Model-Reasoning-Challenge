@@ -1,163 +1,298 @@
-"""
-Phase 2: Build SFT dataset — CoT generation on train, synthetic puzzles, merge and filter.
-Run from project root: python scripts/02_prepare_data.py
-"""
+#!/usr/bin/env python3
+"""Phase 2: Build train_sft.jsonl from train CSV (optional API CoT) + synthetic shards."""
+
+from __future__ import annotations
+
 import argparse
+import hashlib
 import json
 import os
 import re
 import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Any, Dict, Iterable, List
 
-# Ensure project root is on path when run from any cwd (e.g. Kaggle, or scripts/ as cwd)
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 import pandas as pd
+from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from scripts.utils.answer_extractor import extract_boxed_answer
-from scripts.utils.cot_generator import build_training_example, generate_cot_with_retries
-from scripts.utils.data_formatter import DEFAULT_SYSTEM_PROMPT
-from scripts.utils.puzzle_generator import generate_all_synthetic
+from scripts.utils.answer_extractor import answers_match, extract_boxed_answer
+from scripts.utils.cot_generator import generate_cot_with_verification
+from scripts.utils.data_formatter import build_messages, format_assistant_reply
+from scripts.utils.puzzle_generator import write_all_synthetic
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-DATA_DIR = os.path.join(PROJECT_ROOT, "data")
-TRAIN_CSV = os.path.join(DATA_DIR, "train.csv")
-TRAIN_CATEGORIZED_CSV = os.path.join(DATA_DIR, "train_categorized.csv")
-TRAIN_SFT_JSONL = os.path.join(DATA_DIR, "train_sft.jsonl")
-MAX_TOTAL_TOKENS = 7000
+MODEL_ID = "nvidia/Nemotron-3-Nano-30B-A3B-BF16"
 
 
-def load_train_source() -> pd.DataFrame:
-    """Load train.csv or train_categorized.csv."""
-    if os.path.isfile(TRAIN_CATEGORIZED_CSV):
-        return pd.read_csv(TRAIN_CATEGORIZED_CSV)
-    if os.path.isfile(TRAIN_CSV):
-        return pd.read_csv(TRAIN_CSV)
-    raise FileNotFoundError(
-        f"Neither {TRAIN_CATEGORIZED_CSV} nor {TRAIN_CSV} found. Run 01_eda.py or add train.csv."
+def normalize_prompt_key(user_text: str) -> str:
+    t = user_text.strip().lower()
+    t = re.sub(r"\s+", " ", t)
+    return t
+
+
+def fingerprint_record(messages: List[Dict[str, str]]) -> str:
+    user = next((m["content"] for m in messages if m["role"] == "user"), "")
+    h = hashlib.sha1(normalize_prompt_key(user).encode("utf-8")).hexdigest()
+    return h
+
+
+def count_tokens_chat(tokenizer, messages: List[Dict[str, str]]) -> int:
+    try:
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+    except Exception:
+        text = "\n\n".join(f"{m['role']}: {m['content']}" for m in messages)
+    return len(tokenizer(text, add_special_tokens=False)["input_ids"])
+
+
+def infer_puzzle_type_from_meta(rec: Dict[str, Any]) -> str:
+    meta = rec.get("meta") or {}
+    if isinstance(meta, dict) and meta.get("puzzle_type"):
+        return str(meta["puzzle_type"])
+    user = next(
+        (m["content"] for m in rec["messages"] if m["role"] == "user"),
+        "",
     )
+    t = user.lower()
+    if "bit manipulation" in t or "binary string" in t:
+        return "bit_manipulation"
+    if "cipher" in t or "library" in t:
+        return "text_cipher"
+    if "sequence" in t or "next term" in t:
+        return "sequence"
+    if "f(" in t or "numeric puzzle" in t:
+        return "algebraic"
+    return "other"
 
 
-def run_cot_generation(
-    train_df: pd.DataFrame,
-    max_examples: int | None = None,
-    skip_api: bool = False,
-) -> list[dict]:
-    """Generate CoT for each training row; keep only correct answers. Optionally skip API (synthetic-only)."""
-    if skip_api:
-        return []
-    out = []
-    n = len(train_df) if max_examples is None else min(max_examples, len(train_df))
-    for idx in range(n):
-        row = train_df.iloc[idx]
-        prompt = row["prompt"]
-        answer = str(row["answer"]).strip()
-        content, correct = generate_cot_with_retries(prompt, answer)
-        if correct and content:
-            ex = build_training_example(prompt, answer, content, DEFAULT_SYSTEM_PROMPT)
-            out.append(ex)
-        if (idx + 1) % 10 == 0:
-            print(f"  CoT: {idx + 1}/{n} done, kept {len(out)}")
+def balance_records(
+    records: List[Dict[str, Any]],
+    max_per_type: int,
+) -> List[Dict[str, Any]]:
+    rng_groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for r in records:
+        ptype = infer_puzzle_type_from_meta(r)
+        rng_groups[ptype].append(r)
+    out: List[Dict[str, Any]] = []
+    for ptype, items in rng_groups.items():
+        items = items[:max_per_type]
+        out.extend(items)
     return out
 
 
-def load_synthetic_jsonl(path: str) -> list[dict]:
-    """Load a JSONL of {messages: [...]}."""
-    if not os.path.isfile(path):
-        return []
-    out = []
-    with open(path) as f:
+def load_jsonl(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    with path.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            out.append(json.loads(line))
-    return out
+            rows.append(json.loads(line))
+    return rows
 
 
-def filter_and_merge(
-    records: list[dict],
-    tokenizer: AutoTokenizer,
-    max_tokens: int = MAX_TOTAL_TOKENS,
-) -> list[dict]:
-    """Drop duplicates (by normalized user prompt), drop if total tokens > max_tokens, ensure CoT consistent with boxed."""
-    seen_prompts = set()
-    filtered = []
-    for r in records:
-        messages = r.get("messages") or r
-        if not messages or len(messages) < 3:
-            continue
-        user_content = next((m["content"] for m in messages if m.get("role") == "user"), "")
-        norm = re.sub(r"\s+", " ", user_content.strip())
-        if norm in seen_prompts:
-            continue
-        seen_prompts.add(norm)
-        assistant_content = next((m["content"] for m in messages if m.get("role") == "assistant"), "")
-        extracted = extract_boxed_answer(assistant_content)
-        if not extracted:
-            continue
-        full_text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False
-        )
-        num_tokens = len(tokenizer.encode(full_text, add_special_tokens=False))
-        if num_tokens > max_tokens:
-            continue
-        filtered.append({"messages": messages})
-    return filtered
+def save_jsonl(path: Path, records: Iterable[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def row_from_csv(
+    row: pd.Series,
+    cot_text: str,
+    gold: str,
+    puzzle_type: str,
+) -> Dict[str, Any]:
+    prompt = str(row["prompt"])
+    assistant = format_assistant_reply(cot_text, str(gold).strip())
+    rec: Dict[str, Any] = {
+        "messages": build_messages(prompt, assistant),
+        "meta": {
+            "puzzle_type": puzzle_type,
+            "source": "train_csv",
+            "id": str(row.get("id", "")),
+        },
+    }
+    return rec
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Prepare SFT data: CoT + synthetic, then merge.")
-    parser.add_argument("--skip-cot", action="store_true", help="Skip API CoT generation (synthetic only)")
-    parser.add_argument("--max-cot", type=int, default=None, help="Max training examples to get CoT for")
-    parser.add_argument("--synthetic-only", action="store_true", help="Only generate synthetic, no train CoT")
-    parser.add_argument("--bit", type=int, default=200, help="Synthetic bit puzzles")
-    parser.add_argument("--cipher", type=int, default=200, help="Synthetic cipher puzzles")
-    parser.add_argument("--algebraic", type=int, default=200, help="Synthetic algebraic puzzles")
-    parser.add_argument("--sequence", type=int, default=200, help="Synthetic sequence puzzles")
+    parser = argparse.ArgumentParser(description="Prepare SFT JSONL")
+    parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    parser.add_argument(
+        "--train-categorized",
+        type=Path,
+        default=None,
+        help="Default: <data-dir>/train_categorized.csv",
+    )
+    parser.add_argument("--synthetic-dir", type=Path, default=Path("data/synthetic"))
+    parser.add_argument("--output", type=Path, default=Path("data/train_sft.jsonl"))
+    parser.add_argument("--tokenizer-model", type=str, default=MODEL_ID)
+    parser.add_argument("--max-tokens-per-example", type=int, default=7000)
+    parser.add_argument("--max-per-type", type=int, default=2000)
+    parser.add_argument("--synthetic-per-kind", type=int, default=250)
+    parser.add_argument("--skip-cot", action="store_true", help="Skip API CoT on real train")
+    parser.add_argument(
+        "--synthetic-only",
+        action="store_true",
+        help="Alias for --skip-cot (compat with older Kaggle notebooks).",
+    )
+    parser.add_argument(
+        "--max-cot",
+        type=int,
+        default=None,
+        help="Alias for --limit-train (max train rows when using API CoT).",
+    )
+    parser.add_argument(
+        "--bit",
+        type=int,
+        default=None,
+        help="Synthetic count for bit_manipulation (default: --synthetic-per-kind).",
+    )
+    parser.add_argument(
+        "--cipher",
+        type=int,
+        default=None,
+        help="Synthetic count for text_cipher.",
+    )
+    parser.add_argument(
+        "--algebraic",
+        type=int,
+        default=None,
+        help="Synthetic count for algebraic.",
+    )
+    parser.add_argument(
+        "--sequence",
+        type=int,
+        default=None,
+        help="Synthetic count for sequence.",
+    )
+    parser.add_argument(
+        "--cot-backend",
+        choices=["anthropic", "openai"],
+        default="anthropic",
+    )
+    parser.add_argument(
+        "--cot-model",
+        type=str,
+        default="claude-sonnet-4-20250514",
+    )
+    parser.add_argument("--cot-max-tokens", type=int, default=4096)
+    parser.add_argument("--limit-train", type=int, default=0, help="0 = all rows")
     args = parser.parse_args()
 
-    os.chdir(PROJECT_ROOT)
+    if args.synthetic_only:
+        args.skip_cot = True
+    if args.max_cot is not None:
+        args.limit_train = args.max_cot
 
-    tokenizer = AutoTokenizer.from_pretrained("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
-    all_records = []
-
-    if not args.synthetic_only:
-        train_df = load_train_source()
-        print(f"Loaded {len(train_df)} training rows.")
-        cot_records = run_cot_generation(
-            train_df, max_examples=args.max_cot, skip_api=args.skip_cot
+    if not args.skip_cot:
+        env_key = (
+            "ANTHROPIC_API_KEY"
+            if args.cot_backend == "anthropic"
+            else "OPENAI_API_KEY"
         )
-        print(f"CoT records kept: {len(cot_records)}")
-        for r in cot_records:
-            all_records.append({"messages": r["messages"]})
+        if not os.environ.get(env_key):
+            raise SystemExit(
+                f"Missing {env_key}. Set it or use --skip-cot for synthetic-only data."
+            )
 
-    print("Generating synthetic puzzles...")
-    generate_all_synthetic(
-        DATA_DIR,
-        bit_count=args.bit,
-        cipher_count=args.cipher,
-        algebraic_count=args.algebraic,
-        sequence_count=args.sequence,
+    data_dir = args.data_dir
+    train_cat = args.train_categorized or (data_dir / "train_categorized.csv")
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.tokenizer_model,
+        trust_remote_code=True,
     )
-    for name in ["bit_manipulation", "text_cipher", "algebraic", "sequence"]:
-        path = os.path.join(DATA_DIR, "synthetic", f"{name}.jsonl")
-        syn = load_synthetic_jsonl(path)
-        for obj in syn:
-            all_records.append(obj)
-        print(f"  Loaded {len(syn)} from {name}")
 
-    print("Filtering and merging...")
-    merged = filter_and_merge(all_records, tokenizer, max_tokens=MAX_TOTAL_TOKENS)
-    print(f"After filter: {len(merged)} examples.")
+    overrides: Dict[str, int] = {}
+    if args.bit is not None:
+        overrides["bit_manipulation"] = args.bit
+    if args.cipher is not None:
+        overrides["text_cipher"] = args.cipher
+    if args.algebraic is not None:
+        overrides["algebraic"] = args.algebraic
+    if args.sequence is not None:
+        overrides["sequence"] = args.sequence
 
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(TRAIN_SFT_JSONL, "w") as f:
-        for r in merged:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    print(f"Saved: {TRAIN_SFT_JSONL}")
+    paths = write_all_synthetic(
+        args.synthetic_dir,
+        per_kind=args.synthetic_per_kind,
+        seed=42,
+        per_kind_overrides=overrides or None,
+    )
+    synthetic_records: List[Dict[str, Any]] = []
+    for p in paths.values():
+        if p.is_file():
+            synthetic_records.extend(load_jsonl(p))
+    print(f"Synthetic examples: {len(synthetic_records)}")
+
+    api_records: List[Dict[str, Any]] = []
+    if not args.skip_cot:
+        if not train_cat.is_file():
+            raise SystemExit(
+                f"Missing {train_cat}. Run 01_eda.py first or pass --skip-cot."
+            )
+        df = pd.read_csv(train_cat)
+        if args.limit_train > 0:
+            df = df.head(args.limit_train)
+        for _, row in tqdm(df.iterrows(), total=len(df), desc="CoT (API)"):
+            gold = str(row["answer"]).strip()
+            puzzle_type = str(row.get("puzzle_type", "other"))
+            try:
+                res = generate_cot_with_verification(
+                    str(row["prompt"]),
+                    gold,
+                    backend=args.cot_backend,
+                    model=args.cot_model,
+                    max_tokens=args.cot_max_tokens,
+                )
+            except Exception as e:
+                print(f"CoT row failed (id={row.get('id')}): {e!r}")
+                continue
+            if res.extracted is None or not answers_match(gold, res.extracted):
+                continue
+            cot_only = res.raw_text
+            if "\\boxed" in cot_only:
+                cot_only = cot_only.split("\\boxed")[0].rstrip()
+            rec = row_from_csv(row, cot_only, gold, puzzle_type)
+            api_records.append(rec)
+        print(f"API-verified examples: {len(api_records)}")
+    else:
+        print("Skipping API CoT (--skip-cot).")
+
+    merged = synthetic_records + api_records
+    seen: set[str] = set()
+    deduped: List[Dict[str, Any]] = []
+    for r in merged:
+        msgs = r.get("messages")
+        if not isinstance(msgs, list):
+            continue
+        fp = fingerprint_record(msgs)
+        if fp in seen:
+            continue
+        seen.add(fp)
+        deduped.append(r)
+
+    filtered: List[Dict[str, Any]] = []
+    for r in tqdm(deduped, desc="Token filter"):
+        ntok = count_tokens_chat(tokenizer, r["messages"])
+        if ntok <= args.max_tokens_per_example:
+            filtered.append(r)
+
+    balanced = balance_records(filtered, args.max_per_type)
+    counts = Counter(infer_puzzle_type_from_meta(x) for x in balanced)
+    print("Final counts by type:", dict(counts))
+    save_jsonl(args.output, balanced)
+    print(f"Wrote {args.output} ({len(balanced)} rows)")
 
 
 if __name__ == "__main__":

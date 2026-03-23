@@ -1,0 +1,11 @@
+# Nemotron-3 loads Mamba blocks — these are needed for `03_train_lora.py` / full model load.
+#
+# Install ONLY on Linux + NVIDIA CUDA (e.g. Kaggle GPU notebook). Typical macOS installs fail:
+#   - no nvcc
+#   - causal-conv1d setup can raise NameError: bare_metal_version (no supported GPU backend)
+#
+# Kaggle / Colab (GPU):
+#   pip install -r requirements-mamba.txt
+#
+causal-conv1d
+mamba-ssm

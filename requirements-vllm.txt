@@ -1,5 +1,6 @@
-# Install after requirements.txt when you need Phase 4 (evaluation).
-# vLLM is Linux + NVIDIA CUDA only. Do NOT install on macOS — it will fail to build.
-# On Linux with NVIDIA GPU: pip install -r requirements-vllm.txt
-# If that fails (no matching wheel): pip install vllm --pre --extra-index-url https://wheels.vllm.ai/nightly
+# Inference-only environment (often separate from training due to torch pins).
+# Install per vLLM docs for your CUDA version: https://docs.vllm.ai/en/latest/getting_started/installation.html
 vllm>=0.6.0
+pandas
+numpy
+tqdm
