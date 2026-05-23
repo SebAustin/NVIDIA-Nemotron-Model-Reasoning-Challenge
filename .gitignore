@@ -1,4 +1,4 @@
-# --- Python ---
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -8,45 +8,31 @@ build/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-
-# --- Virtual environments / secrets ---
 venv/
 .venv/
 .env
 .env.*
 
-# --- Competition & generated data ---
-# Competition CSVs and all generated training data are not redistributed here.
-# Stage them locally per the README "How to reproduce" steps.
-kaggle/data/*.csv
-kaggle/data/*.jsonl
-kaggle/data/synthetic/
-kaggle/data/reports/*
-!kaggle/data/reports/.gitkeep
+# Data (optional: remove data/*.csv ignore if you version small samples)
+data/train.csv
+data/test.csv
+data/train_categorized.csv
+data/train_sft.jsonl
+data/synthetic/*.jsonl
+data/reports/*
+!data/reports/.gitkeep
 
-# Legacy data layout (pre-refactor)
-data/
-
-# --- Training / inference artifacts ---
+# Training / inference artifacts
 lora_output/
 lora_adapter/
-lora_adapters/
 wandb/
 *.log
 submission.zip
-_kernel_output/
-.kaggle_upload_staging/
 
-# --- Local tooling / scratch ---
-.claude/
-udacity_upload.zip
-*.zip
-Semantic Models/
-
-# --- OS / IDE ---
+# OS / IDE
 .DS_Store
 .idea/
 .vscode/
 
-# --- Jupyter ---
+# Jupyter
 .ipynb_checkpoints/
