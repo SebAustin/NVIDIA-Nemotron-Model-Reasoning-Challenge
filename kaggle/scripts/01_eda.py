@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 from transformers import AutoTokenizer
 
-MODEL_ID = "nvidia/Nemotron-3-Nano-30B-A3B-BF16"
+MODEL_ID = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 
 
 def classify_puzzle_type(prompt: str) -> str:
@@ -117,10 +117,12 @@ def main() -> None:
     answer_kinds = train["answer"].map(answer_kind)
     kind_counts = Counter(answer_kinds)
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.tokenizer_model,
-        trust_remote_code=True,
-    )
+    tm = args.tokenizer_model
+    tm_path = Path(tm)
+    tok_kw: dict = {"trust_remote_code": True}
+    if tm_path.is_dir() and (tm_path / "config.json").is_file():
+        tok_kw["local_files_only"] = True
+    tokenizer = AutoTokenizer.from_pretrained(tm, **tok_kw)
     train_prompt_lens = token_lengths(tokenizer, train["prompt"].tolist())
     train["prompt_tokens"] = train_prompt_lens
 
@@ -182,6 +184,38 @@ def main() -> None:
         tt = np.array(test_lens)
         lines.append("\n## Test prompt token lengths\n")
         lines.append(f"- min: {tt.min()}, max: {tt.max()}, mean: {tt.mean():.1f}\n")
+
+        # Train vs test puzzle-type distribution alignment.
+        # Per Kaggle Grandmasters Playbook tip #1: distribution shift between
+        # train and test will quietly tank a model that validates well.
+        test_types = Counter(test["prompt"].map(classify_puzzle_type))
+        train_total = max(sum(type_counts.values()), 1)
+        test_total = max(sum(test_types.values()), 1)
+        all_types = sorted(set(type_counts) | set(test_types))
+        lines.append("\n## Train vs test puzzle-type distribution\n")
+        lines.append("| puzzle_type | train % | test % | shift (test - train) |\n")
+        lines.append("|---|---|---|---|\n")
+        for t in all_types:
+            tr_pct = 100 * type_counts.get(t, 0) / train_total
+            te_pct = 100 * test_types.get(t, 0) / test_total
+            delta = te_pct - tr_pct
+            flag = " ⚠" if abs(delta) >= 10 else ""
+            lines.append(f"| {t} | {tr_pct:.1f}% | {te_pct:.1f}% | {delta:+.1f}%{flag} |\n")
+        max_shift = max(
+            (
+                abs(
+                    100 * test_types.get(t, 0) / test_total
+                    - 100 * type_counts.get(t, 0) / train_total
+                )
+                for t in all_types
+            ),
+            default=0.0,
+        )
+        if max_shift >= 10:
+            lines.append(
+                f"\n**Distribution shift detected** (max |Δ| = {max_shift:.1f} pp). "
+                "Re-balance synthetic generation per type or pseudo-label test rows.\n"
+            )
 
     report_path = report_dir / "eda_report.md"
     report_path.write_text("".join(lines), encoding="utf-8")

@@ -1,3 +1,0 @@
-# Optional: faster path on supported CUDA setups. Not required if you use --force-peft.
--r requirements.txt
-unsloth

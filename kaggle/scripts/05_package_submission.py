@@ -14,11 +14,21 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-SKIP_NAMES = {
+# Files that look like tokenizer artifacts. Whether to include them is decided
+# at call time. Kaggle's harness loads the LoRA adapter against the base model's
+# tokenizer (a LoRA does not modify embeddings), so shipping these is normally
+# decorative. Two exceptions where they DO matter:
+#   1. We saved a custom `chat_template.jinja` that differs from the base model's.
+#   2. We added special tokens during training (we don't).
+# Phase 0.2 audit chose the safer default: INCLUDE them (`--exclude-tokenizer`
+# to opt out). This matches what `kaggle/kaggle_submission.ipynb` Phase 2 has
+# always done, so the two paths now agree.
+TOKENIZER_NAMES = {
     "tokenizer.json",
     "tokenizer_config.json",
     "special_tokens_map.json",
     "tokenizer.model",
+    "chat_template.jinja",
 }
 
 
@@ -26,7 +36,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Package LoRA submission zip")
     parser.add_argument("--adapter-dir", type=Path, default=Path("lora_adapter"))
     parser.add_argument("--output", type=Path, default=Path("submission.zip"))
-    parser.add_argument("--include-tokenizer", action="store_true")
+    parser.add_argument(
+        "--exclude-tokenizer",
+        action="store_true",
+        help="Strip tokenizer files from the zip (use only for the A/B test).",
+    )
+    # Kept for backwards compat; flips meaning vs `--exclude-tokenizer`.
+    parser.add_argument(
+        "--include-tokenizer",
+        action="store_true",
+        help="Deprecated; tokenizer files are included by default.",
+    )
     args = parser.parse_args()
 
     adapter = args.adapter_dir
@@ -52,9 +72,9 @@ def main() -> None:
     if not safetensors and not bin_files:
         raise SystemExit("No adapter weights found (.safetensors or .bin)")
 
-    skip = set(SKIP_NAMES)
-    if args.include_tokenizer:
-        skip.clear()
+    skip: set[str] = set(TOKENIZER_NAMES) if args.exclude_tokenizer else set()
+    if args.include_tokenizer and args.exclude_tokenizer:
+        raise SystemExit("Pass only one of --include-tokenizer / --exclude-tokenizer")
 
     out_zip = args.output
     with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zf:
