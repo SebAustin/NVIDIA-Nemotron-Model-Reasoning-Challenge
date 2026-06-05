@@ -40,7 +40,8 @@ image = (
         TORCH,
         "transformers>=4.45,<5", "peft", "trl", "datasets", "accelerate",
         "bitsandbytes", "psutil", "pandas", "numpy", "sentencepiece",
-        "huggingface_hub", "hf_transfer", "einops", "ninja", "packaging",
+        "huggingface_hub", "hf_transfer", "einops",
+        "ninja", "packaging", "wheel", "setuptools",  # build tools for --no-build-isolation
     )
     .run_commands(
         f"git clone -b {BRANCH} {REPO} /repo",
