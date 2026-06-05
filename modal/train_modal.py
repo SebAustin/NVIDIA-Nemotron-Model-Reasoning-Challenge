@@ -37,7 +37,7 @@ image = (
         TORCH,
         "transformers>=4.45,<5", "peft", "trl", "datasets", "accelerate",
         "bitsandbytes", "psutil", "pandas", "numpy", "sentencepiece",
-        "huggingface_hub", "hf_transfer",
+        "huggingface_hub", "hf_transfer", "einops",  # einops: required by mamba_ssm
     )
     .run_commands(
         f"git clone -b {BRANCH} {REPO} /repo",

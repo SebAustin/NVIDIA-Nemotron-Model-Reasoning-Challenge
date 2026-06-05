@@ -7,3 +7,4 @@ bitsandbytes
 psutil
 safetensors
 sentencepiece
+einops

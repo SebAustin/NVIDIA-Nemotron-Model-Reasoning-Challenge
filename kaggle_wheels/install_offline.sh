@@ -8,7 +8,7 @@ echo "[offline-install] using wheel dir: $DIR"
 
 # 1) pip-installable training stack (torch/cuda are taken from Kaggle's image)
 pip install --no-index --find-links="$DIR" \
-    transformers peft trl datasets accelerate bitsandbytes psutil sentencepiece safetensors
+    transformers peft trl datasets accelerate bitsandbytes psutil sentencepiece safetensors einops
 
 # 2) torch-ABI-locked: install causal-conv1d BEFORE mamba-ssm (mamba imports it),
 #    --no-deps so pip doesn't try to fetch torch/triton over the network.

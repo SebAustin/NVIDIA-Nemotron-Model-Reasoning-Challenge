@@ -14,3 +14,4 @@ wandb
 scikit-learn
 tqdm
 # Unsloth is optional (GPU/Linux-friendly). See requirements-unsloth.txt — omit on macOS if xformers fails.
+einops
