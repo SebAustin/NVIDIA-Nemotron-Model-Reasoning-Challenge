@@ -26,7 +26,7 @@ from scripts.utils.cot_generator import generate_cot_with_verification
 from scripts.utils.data_formatter import build_messages, format_assistant_reply
 from scripts.utils.puzzle_generator import write_all_synthetic
 
-MODEL_ID = "nvidia/Nemotron-3-Nano-30B-A3B-BF16"
+MODEL_ID = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 
 
 def normalize_prompt_key(user_text: str) -> str:

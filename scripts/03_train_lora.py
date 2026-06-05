@@ -39,7 +39,7 @@ def _kwargs_for_callable(func, kwargs: dict) -> dict:
     params = inspect.signature(func).parameters
     return {k: v for k, v in kwargs.items() if k in params}
 
-MODEL_ID = "nvidia/Nemotron-3-Nano-30B-A3B-BF16"
+MODEL_ID = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 # Bump when changing load/offload behavior (check logs on Kaggle to confirm sync).
 _TRAIN_LORA_BUILD = "2025-03-23+ram-cap-sigkill"
 

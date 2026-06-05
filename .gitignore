@@ -36,3 +36,6 @@ submission.zip
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Local agent/session config
+.claude/

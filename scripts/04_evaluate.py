@@ -20,7 +20,7 @@ from transformers import AutoTokenizer
 from scripts.utils.answer_extractor import answers_match, extract_boxed_answer
 from scripts.utils.data_formatter import DEFAULT_SYSTEM_PROMPT
 
-MODEL_ID = "nvidia/Nemotron-3-Nano-30B-A3B-BF16"
+MODEL_ID = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 
 
 def _classify_local(prompt: str) -> str:

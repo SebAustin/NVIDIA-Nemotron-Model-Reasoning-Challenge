@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 from transformers import AutoTokenizer
 
-MODEL_ID = "nvidia/Nemotron-3-Nano-30B-A3B-BF16"
+MODEL_ID = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 
 
 def classify_puzzle_type(prompt: str) -> str:

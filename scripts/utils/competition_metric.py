@@ -15,7 +15,12 @@ def scores(gold: str, pred: str) -> bool:
     return answers_match_default(gold, pred)
 
 
-def answers_match_default(gold: str, pred: str) -> bool:
+def answers_match_default(gold: str, pred: str, rel_tol: float = 1e-2) -> bool:
+    """Competition rule: correct if exact string match OR within relative tolerance 1e-2.
+
+    Numeric comparison is symmetric relative tolerance (``math.isclose`` semantics)
+    with a small absolute floor so values near zero still compare sanely.
+    """
     g = (gold or "").strip()
     p = (pred or "").strip()
     if g == p:
@@ -23,9 +28,8 @@ def answers_match_default(gold: str, pred: str) -> bool:
     try:
         gv = float(g)
         pv = float(p)
-        if not math.isfinite(gv) or not math.isfinite(pv):
-            return False
-        tol = 1e-6 * max(abs(gv), 1.0)
-        return abs(pv - gv) <= tol
     except ValueError:
         return False
+    if not (math.isfinite(gv) and math.isfinite(pv)):
+        return False
+    return math.isclose(gv, pv, rel_tol=rel_tol, abs_tol=rel_tol)
