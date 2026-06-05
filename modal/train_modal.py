@@ -28,28 +28,33 @@ import modal
 
 REPO = "https://github.com/SebAustin/NVIDIA-Nemotron-Model-Reasoning-Challenge"
 BRANCH = "build/nemotron-pipeline"
-TORCH = "torch==2.6.0"          # cu124; mamba/causal-conv1d built from source against it
-CUDA_TAG = "12.4.1-devel-ubuntu22.04"   # devel image => nvcc available to build mamba
+TORCH = "torch==2.6.0"          # cu124
 
-# Build mamba_ssm + causal_conv1d FROM SOURCE against this exact torch (prebuilt
-# wheels' c10 symbols don't reliably match), targeting A100 (sm_80).
+# Prebuilt mamba/causal-conv1d wheels for torch 2.6 cp312. Use the cxx11abi=TRUE
+# variant: the abiFALSE wheel fails at runtime with an undefined __cxx11 c10 symbol,
+# i.e. this torch build needs the TRUE-abi wheel. Verified by importing at build.
+_GH = "https://github.com/{}/releases/download/{}/{}"
+CAUSAL_WHL = _GH.format(
+    "Dao-AILab/causal-conv1d", "v1.6.2.post1",
+    "causal_conv1d-1.6.2.post1+cu12torch2.6cxx11abiTRUE-cp312-cp312-linux_x86_64.whl")
+MAMBA_WHL = _GH.format(
+    "state-spaces/mamba", "v2.3.2.post1",
+    "mamba_ssm-2.3.2.post1+cu12torch2.6cxx11abiTRUE-cp312-cp312-linux_x86_64.whl")
+
 image = (
-    modal.Image.from_registry(f"nvidia/cuda:{CUDA_TAG}", add_python="3.12")
-    .apt_install("git", "build-essential")
+    modal.Image.debian_slim(python_version="3.12")
+    .apt_install("git")
     .pip_install(
         TORCH,
         "transformers>=4.45,<5", "peft", "trl", "datasets", "accelerate",
         "bitsandbytes", "psutil", "pandas", "numpy", "sentencepiece",
         "huggingface_hub", "hf_transfer", "einops",
-        "ninja", "packaging", "wheel", "setuptools",  # build tools for --no-build-isolation
     )
     .run_commands(
         f"git clone -b {BRANCH} {REPO} /repo",
-        "CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS=4 TORCH_CUDA_ARCH_LIST=8.0 "
-        "CUDA_HOME=/usr/local/cuda pip install --no-build-isolation causal-conv1d",
-        "MAMBA_FORCE_BUILD=TRUE MAX_JOBS=4 TORCH_CUDA_ARCH_LIST=8.0 "
-        "CUDA_HOME=/usr/local/cuda pip install --no-build-isolation mamba-ssm",
-        "python -c 'import causal_conv1d, mamba_ssm; print(\"mamba build OK\")'",
+        f"pip install --no-deps '{CAUSAL_WHL}' '{MAMBA_WHL}'",
+        # verify the .so symbols resolve against this torch (no GPU needed)
+        "python -c 'import causal_conv1d, mamba_ssm; print(\"mamba import OK\")'",
     )
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "PYTHONUNBUFFERED": "1"})
 )
