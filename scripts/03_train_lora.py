@@ -92,22 +92,36 @@ def human_max_memory() -> Dict:
     return mm
 
 
-def load_base_model(offload_dir: Path):
+def resolve_model_source() -> str:
+    """Model weights location: --model-path/MODEL_PATH env, else a Kaggle model
+    mount if present (avoids a ~60GB HF re-download), else the HF id."""
+    env = os.environ.get("MODEL_PATH")
+    if env:
+        return env
+    import glob
+
+    for pat in (
+        "/kaggle/input/**/config.json",
+        "/kaggle/input/**/nemotron*/**/config.json",
+    ):
+        hits = glob.glob(pat, recursive=True)
+        hits = [h for h in hits if "nemotron" in h.lower()]
+        if hits:
+            return str(Path(hits[0]).parent)
+    return MODEL_ID
+
+
+def load_base_model(offload_dir: Path, model_src: str, load_8bit: bool = True):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-    tok = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+    print(f"[lora] loading base model from: {model_src} (8bit={load_8bit})")
+    tok = AutoTokenizer.from_pretrained(model_src, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    quant = BitsAndBytesConfig(
-        load_in_8bit=True,
-        llm_int8_enable_fp32_cpu_offload=True,  # required when offloading to CPU
-    )
     offload_dir.mkdir(parents=True, exist_ok=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
-        quantization_config=quant,
+    kwargs = dict(
         device_map="auto",
         max_memory=human_max_memory(),
         offload_folder=str(offload_dir),
@@ -115,6 +129,14 @@ def load_base_model(offload_dir: Path):
         attn_implementation="eager",
         torch_dtype=torch.bfloat16,
     )
+    if load_8bit:
+        # 2x T4 path: 8-bit + CPU offload (4-bit is unreliable on this hybrid model)
+        kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_enable_fp32_cpu_offload=True,
+        )
+    # else: bf16 weights straight onto a big GPU (A100/H100) — faster, no int8 materialize
+    model = AutoModelForCausalLM.from_pretrained(model_src, **kwargs)
     model.config.use_cache = False
     return model, tok
 
@@ -318,9 +340,16 @@ def main() -> None:
     ap.add_argument("--data-path", type=Path, default=Path("data/train_sft.jsonl"))
     ap.add_argument("--output-dir", type=Path, default=Path("lora_adapter"))
     ap.add_argument("--offload-dir", type=Path, default=Path("offload"))
+    ap.add_argument("--model-path", type=str, default=None,
+                    help="Base model dir/HF id. Default: MODEL_PATH env, else a "
+                         "Kaggle model mount if found, else the HF id.")
+    ap.add_argument("--no-8bit", action="store_true",
+                    help="Load bf16 weights directly (big GPU, e.g. A100/H100).")
     ap.add_argument("--no-smoke", action="store_true", help="Skip the smoke test.")
     ap.add_argument("--smoke-only", action="store_true")
     args = ap.parse_args()
+    model_src = args.model_path or resolve_model_source()
+    load_8bit = not args.no_8bit and os.environ.get("LOAD_8BIT", "1") != "0"
 
     r = min(int(os.environ.get("LORA_R", "16")), 32)
     alpha = int(os.environ.get("LORA_ALPHA", str(2 * r)))
@@ -344,7 +373,7 @@ def main() -> None:
     try:
         from trl import SFTTrainer
 
-        model, tok = load_base_model(args.offload_dir)
+        model, tok = load_base_model(args.offload_dir, model_src, load_8bit)
         verify_target_modules(model, target_regex)
         model = build_peft_model(model, r, alpha, target_regex)
         full_ds = to_text_dataset(records, tok)

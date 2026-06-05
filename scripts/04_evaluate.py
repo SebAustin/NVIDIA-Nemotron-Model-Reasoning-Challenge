@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -61,7 +62,10 @@ def main() -> None:
     ap.add_argument("--report-dir", type=Path, default=Path("data/reports"))
     ap.add_argument("--base-only", action="store_true",
                     help="Evaluate the base model with NO adapter (baseline).")
+    ap.add_argument("--model-path", type=str, default=None,
+                    help="Base model dir/HF id (default: MODEL_PATH env, else HF id).")
     args = ap.parse_args()
+    model_src = args.model_path or os.environ.get("MODEL_PATH") or MODEL_ID
 
     src = args.train_categorized or (args.data_dir / "train_categorized.csv")
     if not src.is_file():
@@ -90,11 +94,11 @@ def main() -> None:
             "(requirements-vllm.txt)."
         ) from e
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_src, trust_remote_code=True)
     prompts = [build_prompt(tokenizer, str(r.prompt)) for r in val.itertuples(index=False)]
 
     llm = LLM(
-        model=MODEL_ID,
+        model=model_src,
         enable_lora=not args.base_only,
         max_lora_rank=32,
         max_model_len=8192,
