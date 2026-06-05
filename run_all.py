@@ -48,19 +48,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run full Nemotron pipeline")
     parser.add_argument("--skip-eda", action="store_true", help="Skip Phase 1 EDA")
     parser.add_argument("--skip-prepare", action="store_true", help="Skip Phase 2 data prep")
-    parser.add_argument("--synthetic-only", action="store_true", help="Phase 2: only synthetic data")
     parser.add_argument("--skip-train", action="store_true", help="Skip Phase 3 LoRA training")
     parser.add_argument("--skip-eval", action="store_true", help="Skip Phase 4 evaluation")
     parser.add_argument("--skip-package", action="store_true", help="Skip Phase 5 packaging")
-    parser.add_argument("--max-cot", type=int, default=None, help="Phase 2: max CoT examples")
+    parser.add_argument("--limit-train", type=int, default=None,
+                        help="Phase 2: limit number of real train rows used")
     args = parser.parse_args()
 
+    prep_args = []
+    if args.limit_train is not None:
+        prep_args = ["--limit-train", str(args.limit_train)]
     steps = [
         (not args.skip_eda, "01_eda.py", []),
-        (not args.skip_prepare, "02_prepare_data.py", (
-            ["--synthetic-only"] if args.synthetic_only else []
-            + (["--max-cot", str(args.max_cot)] if args.max_cot is not None else [])
-        )),
+        (not args.skip_prepare, "02_prepare_data.py", prep_args),
         (not args.skip_train, "03_train_lora.py", []),
         (not args.skip_eval, "04_evaluate.py", []),
         (not args.skip_package, "05_package_submission.py", []),

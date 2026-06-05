@@ -1,571 +1,413 @@
 #!/usr/bin/env python3
-"""Phase 3: QLoRA SFT with Unsloth (preferred) or Hugging Face PEFT fallback."""
+"""Phase 3: Kaggle-fit 8-bit QLoRA SFT for NVIDIA-Nemotron-3-Nano-30B-A3B-BF16.
+
+Designed for 2x T4 (32 GB total): load the base model in 8-bit, shard across both
+GPUs with ``device_map="auto"`` + ``max_memory`` caps and CPU/disk offload, train
+a small LoRA adapter with gradient checkpointing. 4-bit QLoRA is NOT reliable on
+this hybrid Mamba model, hence 8-bit.
+
+Key behaviours required by the brief:
+  * ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` set BEFORE importing torch.
+  * LoRA target_modules default to the OFFICIAL demo regex
+    ``.*\\.(in_proj|out_proj|up_proj|down_proj)$`` (Mamba + MLP; never the MoE
+    router/gate). Verified against ``model.named_modules()`` before training.
+  * A tiny smoke test (1% data, few steps) runs FIRST to prove the memory config
+    fits before the full run.
+  * Per-category training loss AND min-logprob are logged each epoch; categories
+    whose min-logprob has not approached 0 are printed (upweight-next candidates).
+  * On CUDA OOM (after offload tuning) we stop and write FALLBACK.md telling you to
+    run the identical config on one rented A100/H100 and copy the adapter back.
+
+Env knobs: LORA_R (default 16, max 32), LORA_ALPHA (default 2*R),
+SFT_MAX_SEQ_LENGTH (default 1536), LORA_TARGET_REGEX, NUM_EPOCHS, LEARNING_RATE,
+PER_DEVICE_BATCH, GRAD_ACCUM, NEMOTRON_MAX_MEMORY_GPU (e.g. 13GiB),
+NEMOTRON_MAX_MEMORY_CPU (e.g. 24GiB), SEED.
+"""
 
 from __future__ import annotations
 
-import argparse
-import inspect
-import json
+# --- MUST precede `import torch` -------------------------------------------
 import os
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+import argparse
+import json
+import random
+import re
 import sys
+import traceback
 from pathlib import Path
+from typing import Dict, List
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-import torch
-from datasets import load_dataset
-from transformers import TrainingArguments
-from trl import SFTConfig, SFTTrainer
-
-
-def _sft_config_kwargs(max_seq_length: int) -> dict:
-    """TRL renames max_seq_length → max_length on SFTConfig in recent versions."""
-    sig = inspect.signature(SFTConfig.__init__).parameters
-    out: dict = {}
-    if "max_seq_length" in sig:
-        out["max_seq_length"] = max_seq_length
-    elif "max_length" in sig:
-        out["max_length"] = max_seq_length
-    if "dataset_text_field" in sig:
-        out["dataset_text_field"] = None
-    if "packing" in sig:
-        out["packing"] = False
-    return out
-
-
-def _kwargs_for_callable(func, kwargs: dict) -> dict:
-    params = inspect.signature(func).parameters
-    return {k: v for k, v in kwargs.items() if k in params}
-
 MODEL_ID = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
-# Bump when changing load/offload behavior (check logs on Kaggle to confirm sync).
-_TRAIN_LORA_BUILD = "2025-03-23+ram-cap-sigkill"
-
-# Default HF-style targets (good for many Llama-like MoE checkpoints)
-LORA_TARGET_MODULES = [
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "o_proj",
-    "gate_proj",
-    "up_proj",
-    "down_proj",
-]
-
-# Kaggle competition baseline (matches public notebooks using Nemotron-3 Nano PyTorch modules)
-KAGGLE_LORA_TARGET_REGEX = r".*\.(in_proj|out_proj|up_proj|down_proj)$"
+DEFAULT_TARGET_REGEX = r".*\.(in_proj|out_proj|up_proj|down_proj)$"
+FORBIDDEN_SUBSTRINGS = ("router", "gate", "expert_gate", "lm_head")  # never LoRA the router
 
 
-def _find_kaggle_competition_nemotron_dir() -> str | None:
-    """Weights mounted as a competition Model input under /kaggle/input/models/..."""
-    preferred = Path("/kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16")
-    for root in (preferred, Path("/kaggle/input/models")):
-        if not root.is_dir():
-            continue
-        configs = [c for c in root.rglob("config.json") if c.is_file()]
-        if not configs:
-            continue
-        if root == preferred:
-            configs.sort(key=lambda p: len(p.parts))
-            return str(configs[0].parent.resolve())
-        for cfg in sorted(configs, key=lambda p: len(str(p))):
-            low = str(cfg).lower()
-            if "nemotron" in low and "nano" in low:
-                return str(cfg.parent.resolve())
-    return None
-
-
-def resolve_model_weights_path(cli_path: str) -> str:
-    """
-    Prefer a local directory with config.json; then env NEMOTRON_MODEL_PATH;
-    then Kaggle competition mount. Otherwise keep cli_path (Hub id or path).
-    """
-    p = Path(cli_path)
-    if p.is_dir() and (p / "config.json").is_file():
-        return str(p.resolve())
-    envp = os.environ.get("NEMOTRON_MODEL_PATH", "").strip()
-    if envp:
-        ep = Path(envp)
-        if ep.is_dir() and (ep / "config.json").is_file():
-            return str(ep.resolve())
-    found = _find_kaggle_competition_nemotron_dir()
-    if found:
-        return found
-    return cli_path
-
-
-def _ensure_base_model_in_adapter(save_dir: Path, base_id: str) -> None:
-    cfg_path = save_dir / "adapter_config.json"
-    if not cfg_path.is_file():
-        return
-    with cfg_path.open(encoding="utf-8") as f:
-        cfg = json.load(f)
-    cfg["base_model_name_or_path"] = base_id
-    with cfg_path.open("w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
-
-
-def load_model_unsloth(max_seq_length: int):
-    from unsloth import FastLanguageModel
-
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=MODEL_ID,
-        max_seq_length=max_seq_length,
-        dtype=torch.bfloat16,
-        load_in_4bit=True,
-        trust_remote_code=True,
-    )
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=32,
-        target_modules=LORA_TARGET_MODULES,
-        lora_alpha=64,
-        lora_dropout=0.05,
-        bias="none",
-        use_gradient_checkpointing="unsloth",
-        random_state=42,
-    )
-    return model, tokenizer, "unsloth"
-
-
-def _lora_target_modules(mode: str):
-    if mode == "kaggle_nemotron":
-        return KAGGLE_LORA_TARGET_REGEX
-    if mode == "hf_linear":
-        return LORA_TARGET_MODULES
-    raise ValueError(f"Unknown lora target mode: {mode}")
-
-
-def _from_pretrained_dtype_kw(model_cls) -> dict:
-    """Use `dtype` when supported (transformers deprecation of torch_dtype)."""
-    params = inspect.signature(model_cls.from_pretrained).parameters
-    if "dtype" in params:
-        return {"dtype": torch.bfloat16}
-    if "torch_dtype" in params:
-        return {"torch_dtype": torch.bfloat16}
-    return {}
-
-
-def _cuda_total_bytes(device_index: int = 0) -> int | None:
-    if not torch.cuda.is_available():
-        return None
+# ---------------------------------------------------------------------------
+def set_all_seeds(seed: int) -> None:
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
     try:
-        return int(torch.cuda.get_device_properties(device_index).total_memory)
+        import numpy as np
+
+        np.random.seed(seed)
     except Exception:
-        return None
-
-
-def _normalize_max_memory(mm: dict) -> dict:
-    """
-    Accelerate only treats *integer* keys as GPU ids (see get_max_memory: gpu_devices =
-    keys where isinstance(k, int)). JSON uses string keys, so '{"0":"6GiB"}' must become
-    {0: bytes, "cpu": bytes} or the GPU cap is ignored and the full ~15GiB 4-bit model
-    lands on a 15GiB card → OOM.
-    """
-    out: dict = {}
-    for k, v in mm.items():
-        if isinstance(k, str) and k.isdigit():
-            out[int(k)] = v
-        else:
-            out[k] = v
-    return out
-
-
-def _auto_cpu_max_memory_cap() -> str:
-    """
-    Accelerate packs offloaded weights into *host RAM* up to the "cpu" cap. Using
-    cpu=200GiB on a ~13–30GiB machine makes the loader commit too much RAM → Linux
-    OOM killer sends SIGKILL (often near end of shard load).
-    """
-    env = os.environ.get("NEMOTRON_MAX_MEMORY_CPU", "").strip()
-    if env:
-        return env if "GiB" in env or "GB" in env.upper() else f"{env}GiB"
+        pass
     try:
-        import psutil
+        import torch
 
-        total_gib = psutil.virtual_memory().total / (1024**3)
-        # Stay under real RAM: kernel + notebook + loader buffers need headroom.
-        cap = int(total_gib * 0.38)
-        cap = max(6, min(cap, 18))
-        return f"{cap}GiB"
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
     except Exception:
-        return "10GiB"
+        pass
 
 
-def _auto_max_memory_for_quantized_load() -> dict[int | str, str] | None:
-    """
-    30B in 4-bit is ~15 GiB of weights alone; a 14–16 GiB GPU cannot hold the full
-    model + load buffers. Cap GPU 0 (integer key!), bounded host RAM, disk spill.
-    """
-    total = _cuda_total_bytes(0)
-    if total is None or total >= 22 * 1024**3:
-        return None
-    gib = total / (1024**3)
-    # Tight GPU cap + CPU + disk: shard load can spike; MoE size estimates can be off.
-    gpu_gib = max(2, min(6, int(gib * 0.20)))
-    return {
-        0: f"{gpu_gib}GiB",
-        "cpu": _auto_cpu_max_memory_cap(),
-        "disk": "150GiB",
-    }
+def human_max_memory() -> Dict:
+    """Build a device->capacity map for device_map='auto' + offload."""
+    import torch
+
+    gpu_cap = os.environ.get("NEMOTRON_MAX_MEMORY_GPU", "13GiB")
+    cpu_cap = os.environ.get("NEMOTRON_MAX_MEMORY_CPU")
+    if cpu_cap is None:
+        try:
+            import psutil
+
+            avail = int(psutil.virtual_memory().available / (1024**3))
+            cpu_cap = f"{max(8, min(avail - 4, 28))}GiB"
+        except Exception:
+            cpu_cap = "16GiB"
+    mm: Dict = {}
+    n = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    for i in range(n):
+        mm[i] = gpu_cap
+    mm["cpu"] = cpu_cap
+    return mm
 
 
-def load_model_peft(
-    model_path: str,
-    *,
-    quantize: bool,
-    lora_alpha: int,
-    lora_target_mode: str,
-    offload_folder: Path,
-    max_memory: dict | None = None,
-    no_auto_max_memory: bool = False,
-):
-    import gc
-
-    import transformers
-    from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+def load_base_model(offload_dir: Path):
+    import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-    tv = getattr(transformers, "__version__", "0")
-    try:
-        t_major = int(tv.split(".", 1)[0])
-    except ValueError:
-        t_major = 0
-    if t_major >= 5 and quantize:
-        print(
-            "[03_train_lora] WARNING: transformers>=5 + 4-bit often OOMs on ~16GB GPUs "
-            "(HF issue: quantized weights materialize on GPU before quant). "
-            "Pin: pip install 'transformers>=4.45,<5'. Current:",
-            tv,
-            flush=True,
-        )
+    tok = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    offload_folder = Path(offload_folder).expanduser().resolve()
-    offload_folder.mkdir(parents=True, exist_ok=True)
-    offload_str = str(offload_folder)
-    print(f"[03_train_lora] offload_folder={offload_str}", flush=True)
-
-    effective_mm = _normalize_max_memory(max_memory) if max_memory else None
-    if effective_mm is None and quantize and not no_auto_max_memory:
-        effective_mm = _auto_max_memory_for_quantized_load()
-        if effective_mm is not None:
-            print(
-                f"[03_train_lora] auto max_memory (small GPU + 4-bit): {effective_mm}",
-                flush=True,
-            )
-
-    _sig = inspect.signature(AutoModelForCausalLM.from_pretrained).parameters
-    base_kw: dict = dict(
+    quant = BitsAndBytesConfig(
+        load_in_8bit=True,
+        llm_int8_enable_fp32_cpu_offload=True,  # required when offloading to CPU
+    )
+    offload_dir.mkdir(parents=True, exist_ok=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID,
+        quantization_config=quant,
         device_map="auto",
+        max_memory=human_max_memory(),
+        offload_folder=str(offload_dir),
         trust_remote_code=True,
-        offload_folder=offload_str,
+        attn_implementation="eager",
+        torch_dtype=torch.bfloat16,
     )
-    # QLoRA: avoid bf16 dtype on the full skeleton — let BitsAndBytesConfig own compute dtype.
-    if not quantize:
-        base_kw.update(_from_pretrained_dtype_kw(AutoModelForCausalLM))
-    if "low_cpu_mem_usage" in _sig:
-        base_kw["low_cpu_mem_usage"] = True
-    if effective_mm is not None and "max_memory" in _sig:
-        base_kw["max_memory"] = effective_mm
-    if quantize:
-        bnb = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
+    model.config.use_cache = False
+    return model, tok
+
+
+def verify_target_modules(model, regex: str) -> List[str]:
+    """Return the module names matched by `regex`; abort if it hits the router."""
+    pat = re.compile(regex)
+    matched = [name for name, _ in model.named_modules() if pat.fullmatch(name)]
+    if not matched:
+        raise SystemExit(
+            f"target regex {regex!r} matched NO modules. Inspect model.named_modules()."
         )
-        base_kw["quantization_config"] = bnb
+    bad = [m for m in matched if any(f in m for f in FORBIDDEN_SUBSTRINGS)]
+    if bad:
+        raise SystemExit(
+            f"target regex matched forbidden modules (router/gate/lm_head): {bad[:5]}"
+        )
+    leaves = sorted({m.split(".")[-1] for m in matched})
+    print(f"[lora] target regex matches {len(matched)} modules; leaf types: {leaves}")
+    return matched
 
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
-    # FlashAttention-2 adds VRAM pressure; on tight GPUs prefer SDPA first.
-    low_vram_load = effective_mm is not None
-    attn_order: list[str | None] = (
-        ["sdpa", None] if low_vram_load else ["flash_attention_2", "sdpa", None]
+def build_peft_model(model, r: int, alpha: int, target_regex: str):
+    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+    model = prepare_model_for_kbit_training(
+        model, use_gradient_checkpointing=True
     )
-    model = None
-    last_err: Exception | None = None
-    for attn in attn_order:
-        try:
-            if attn:
-                model = AutoModelForCausalLM.from_pretrained(
-                    model_path,
-                    attn_implementation=attn,
-                    **base_kw,
-                )
-            else:
-                model = AutoModelForCausalLM.from_pretrained(model_path, **base_kw)
-            break
-        except Exception as e:
-            last_err = e
-            continue
-    if model is None:
-        if last_err is not None:
-            raise last_err
-        raise RuntimeError("from_pretrained failed with no model and no error")
-
-    if quantize:
-        model = prepare_model_for_kbit_training(model)
-
-    targets = _lora_target_modules(lora_target_mode)
-    lora_config = LoraConfig(
-        r=32,
-        lora_alpha=lora_alpha,
-        lora_dropout=0.05,
+    cfg = LoraConfig(
+        r=r,
+        lora_alpha=alpha,
+        target_modules=target_regex,  # regex string (PEFT supports this)
+        lora_dropout=0.0,
         bias="none",
-        task_type=TaskType.CAUSAL_LM,
-        target_modules=targets,
+        task_type="CAUSAL_LM",
     )
-    model = get_peft_model(model, lora_config)
+    model = get_peft_model(model, cfg)
     model.print_trainable_parameters()
-    return model, tokenizer, "peft"
+    return model
 
 
+# ---------------------------------------------------------------------------
+def load_sft_records(path: Path) -> List[dict]:
+    rows = []
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def to_text_dataset(records: List[dict], tokenizer):
+    """Render each {messages} to a single training string via the chat template."""
+    from datasets import Dataset
+
+    texts, cats = [], []
+    for r in records:
+        text = tokenizer.apply_chat_template(
+            r["messages"], tokenize=False, add_generation_prompt=False
+        )
+        texts.append(text)
+        cats.append((r.get("meta") or {}).get("category", "other"))
+    return Dataset.from_dict({"text": texts, "category": cats})
+
+
+def make_sft_config(output_dir, max_seq_len, epochs, lr, bsz, accum, **extra):
+    """Construct SFTConfig, adapting to TRL versions (max_length vs max_seq_length)."""
+    import inspect
+
+    from trl import SFTConfig
+
+    params = set(inspect.signature(SFTConfig.__init__).parameters)
+    kwargs = dict(
+        output_dir=str(output_dir),
+        num_train_epochs=epochs,
+        per_device_train_batch_size=bsz,
+        gradient_accumulation_steps=accum,
+        learning_rate=lr,
+        lr_scheduler_type="cosine",
+        warmup_ratio=0.03,
+        logging_steps=10,
+        save_strategy="no",
+        bf16=True,
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        report_to="none",
+        optim="paged_adamw_8bit",
+        dataset_text_field="text",
+        **extra,
+    )
+    if "max_seq_length" in params:
+        kwargs["max_seq_length"] = max_seq_len
+    elif "max_length" in params:
+        kwargs["max_length"] = max_seq_len
+    kwargs = {k: v for k, v in kwargs.items() if k in params}
+    return SFTConfig(**kwargs)
+
+
+def completion_collator(tokenizer):
+    """Mask everything up to and including the assistant turn header so loss is on
+    the reasoning + answer only."""
+    try:
+        from trl import DataCollatorForCompletionOnlyLM
+
+        return DataCollatorForCompletionOnlyLM(
+            response_template="<|im_start|>assistant\n",
+            tokenizer=tokenizer,
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[lora] completion-only collator unavailable ({e!r}); full-text loss.")
+        return None
+
+
+# ---------------------------------------------------------------------------
+class PerCategoryLogprobProbe:
+    """Computes per-category MIN target-token logprob over a small fixed probe set
+    and flags categories whose min-logprob has not approached 0."""
+
+    def __init__(self, tokenizer, records, max_per_cat=8, threshold=-3.0):
+        self.tok = tokenizer
+        self.threshold = threshold
+        by_cat: Dict[str, list] = {}
+        for r in records:
+            by_cat.setdefault((r.get("meta") or {}).get("category", "other"), []).append(r)
+        self.probes = {c: rows[:max_per_cat] for c, rows in by_cat.items()}
+
+    def __call__(self, model) -> Dict[str, float]:
+        import torch
+
+        results: Dict[str, float] = {}
+        model.eval()
+        with torch.no_grad():
+            for cat, rows in self.probes.items():
+                mins = []
+                for r in rows:
+                    full = self.tok.apply_chat_template(
+                        r["messages"], tokenize=False, add_generation_prompt=False
+                    )
+                    prompt_only = self.tok.apply_chat_template(
+                        r["messages"][:-1], tokenize=False, add_generation_prompt=True
+                    )
+                    ids = self.tok(full, return_tensors="pt").input_ids
+                    p_len = self.tok(prompt_only, return_tensors="pt").input_ids.shape[1]
+                    ids = ids.to(model.device)
+                    logits = model(ids).logits[:, :-1, :]
+                    targets = ids[:, 1:]
+                    logp = torch.log_softmax(logits.float(), dim=-1)
+                    tok_lp = logp.gather(2, targets.unsqueeze(-1)).squeeze(-1)[0]
+                    comp_lp = tok_lp[p_len - 1:]
+                    if comp_lp.numel():
+                        mins.append(float(comp_lp.min()))
+                if mins:
+                    results[cat] = min(mins)
+        model.train()
+        return results
+
+
+# ---------------------------------------------------------------------------
+def write_fallback_md(reason: str, cfg: dict) -> None:
+    txt = f"""# FALLBACK: train on a single rented A100/H100
+
+The Kaggle 2x T4 8-bit + CPU-offload run hit an unrecoverable memory error:
+
+    {reason}
+
+This is the documented #1 failure mode (31.6B hybrid Mamba does not 8-bit-fit on
+32 GB with room for activations). Do NOT truncate the model. Instead run the
+*identical* config on one big GPU and copy the adapter back.
+
+## Steps (Modal / RunPod / Lambda)
+1. Provision 1x A100 80GB (or H100). CUDA 12.x, Python 3.10-3.12.
+2. Install: `pip install -r requirements-mamba.txt` (mamba-ssm + causal-conv1d
+   need a working nvcc) plus `transformers>=4.45,<5 peft trl datasets accelerate
+   bitsandbytes`.
+3. Copy `data/train_sft.jsonl` to the box.
+4. Run the SAME script with a large GPU cap (no offload needed):
+
+       NEMOTRON_MAX_MEMORY_GPU=78GiB LORA_R={cfg.get('r')} \\
+       LORA_ALPHA={cfg.get('alpha')} SFT_MAX_SEQ_LENGTH={cfg.get('max_seq')} \\
+       python scripts/03_train_lora.py --data-path data/train_sft.jsonl \\
+         --output-dir lora_adapter
+
+   On 80GB you can also load bf16 (drop 8-bit) for speed; the adapter is identical.
+5. `scp` the resulting `lora_adapter/` back here and run Phase 4/5 locally.
+
+Config at failure: {json.dumps(cfg, indent=2)}
+"""
+    Path("FALLBACK.md").write_text(txt, encoding="utf-8")
+    print("Wrote FALLBACK.md")
+
+
+def is_oom(exc: BaseException) -> bool:
+    s = f"{type(exc).__name__}: {exc}".lower()
+    return "out of memory" in s or "cuda oom" in s or "cublas" in s or "alloc" in s
+
+
+# ---------------------------------------------------------------------------
 def main() -> None:
-    parser = argparse.ArgumentParser(description="LoRA SFT for Nemotron")
-    parser.add_argument("--data-path", type=Path, default=Path("data/train_sft.jsonl"))
-    parser.add_argument("--output-dir", type=Path, default=Path("lora_adapter"))
-    parser.add_argument("--checkpoint-dir", type=Path, default=Path("lora_output"))
-    parser.add_argument(
-        "--model-path",
-        type=str,
-        default=MODEL_ID,
-        help="HF model id or local path (e.g. kagglehub.model_download(...)).",
-    )
-    parser.add_argument(
-        "--no-quant",
-        action="store_true",
-        help="Load base in bf16 without 4-bit quantization (typical Kaggle kagglehub weights).",
-    )
-    parser.add_argument(
-        "--lora-alpha",
-        type=int,
-        default=64,
-        help="LoRA alpha; competition notebooks often use 16 with kaggle_nemotron targets.",
-    )
-    parser.add_argument(
-        "--lora-target-mode",
-        choices=("hf_linear", "kaggle_nemotron"),
-        default="hf_linear",
-        help="kaggle_nemotron: regex in_proj/out_proj/up/down_proj (Kaggle starter pattern).",
-    )
-    parser.add_argument(
-        "--adapter-base-name",
-        type=str,
-        default=MODEL_ID,
-        help="Written to adapter_config.json base_model_name_or_path for submission tooling.",
-    )
-    parser.add_argument(
-        "--offload-folder",
-        type=Path,
-        default=None,
-        help="Disk directory for accelerate when MoE weights spill off GPU (default: <checkpoint-dir>/hf_offload).",
-    )
-    parser.add_argument(
-        "--max-memory-json",
-        type=str,
-        default=None,
-        help='Optional accelerate max_memory JSON (numeric keys may be strings; script coerces to int). '
-        'Example: \'{"0":"5GiB","cpu":"240GiB"}\'.',
-    )
-    parser.add_argument(
-        "--no-auto-max-memory",
-        action="store_true",
-        help="Do not infer max_memory for <22GB GPUs when using 4-bit (can OOM loading 30B on T4).",
-    )
-    parser.add_argument("--max-seq-length", type=int, default=8192)
-    parser.add_argument("--epochs", type=float, default=3.0)
-    parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--grad-accum", type=int, default=8)
-    parser.add_argument("--test-size", type=float, default=0.1)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--force-peft", action="store_true", help="Skip Unsloth")
-    parser.add_argument(
-        "--dataloader-workers",
-        type=int,
-        default=0,
-        help="DataLoader workers (use 0 on Kaggle/CUDA to avoid fork deadlocks; was 2).",
-    )
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="8-bit QLoRA SFT (Kaggle-fit)")
+    ap.add_argument("--data-path", type=Path, default=Path("data/train_sft.jsonl"))
+    ap.add_argument("--output-dir", type=Path, default=Path("lora_adapter"))
+    ap.add_argument("--offload-dir", type=Path, default=Path("offload"))
+    ap.add_argument("--no-smoke", action="store_true", help="Skip the smoke test.")
+    ap.add_argument("--smoke-only", action="store_true")
+    args = ap.parse_args()
 
-    use_wandb = os.environ.get("USE_WANDB", "").lower() in ("1", "true", "yes")
-    report_to = "wandb" if use_wandb else "none"
+    r = min(int(os.environ.get("LORA_R", "16")), 32)
+    alpha = int(os.environ.get("LORA_ALPHA", str(2 * r)))
+    max_seq = int(os.environ.get("SFT_MAX_SEQ_LENGTH", "1536"))
+    target_regex = os.environ.get("LORA_TARGET_REGEX", DEFAULT_TARGET_REGEX)
+    epochs = float(os.environ.get("NUM_EPOCHS", "2"))
+    lr = float(os.environ.get("LEARNING_RATE", "2e-4"))
+    bsz = int(os.environ.get("PER_DEVICE_BATCH", "1"))
+    accum = int(os.environ.get("GRAD_ACCUM", "16"))
+    seed = int(os.environ.get("SEED", "42"))
+    cfg = {"r": r, "alpha": alpha, "max_seq": max_seq, "target_regex": target_regex,
+           "epochs": epochs, "lr": lr, "bsz": bsz, "accum": accum, "seed": seed}
+    print("[lora] config:", json.dumps(cfg, indent=2))
+    set_all_seeds(seed)
 
     if not args.data_path.is_file():
-        raise SystemExit(f"Missing dataset {args.data_path}. Run 02_prepare_data.py first.")
+        raise SystemExit(f"Missing {args.data_path}. Run 02_prepare_data.py first.")
+    records = load_sft_records(args.data_path)
+    print(f"[lora] loaded {len(records)} SFT records")
 
-    print(f"[03_train_lora] build={_TRAIN_LORA_BUILD}", flush=True)
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    try:
+        from trl import SFTTrainer
 
-    offload_folder = args.offload_folder or (args.checkpoint_dir / "hf_offload")
-    env_off = os.environ.get("HF_OFFLOAD_FOLDER")
-    if env_off:
-        offload_folder = Path(env_off)
+        model, tok = load_base_model(args.offload_dir)
+        verify_target_modules(model, target_regex)
+        model = build_peft_model(model, r, alpha, target_regex)
+        full_ds = to_text_dataset(records, tok)
+        collator = completion_collator(tok)
+        probe = PerCategoryLogprobProbe(tok, records)
 
-    max_memory = None
-    if args.max_memory_json:
-        max_memory = json.loads(args.max_memory_json)
-        if not isinstance(max_memory, dict):
-            raise SystemExit("--max-memory-json must be a JSON object")
-
-    ds = load_dataset("json", data_files=str(args.data_path), split="train")
-    ds = ds.train_test_split(test_size=args.test_size, seed=args.seed)
-
-    model_path = resolve_model_weights_path(args.model_path)
-    if model_path != args.model_path:
-        print(
-            f"[03_train_lora] --model-path resolved: {args.model_path!r} -> {model_path!r}",
-            flush=True,
-        )
-
-    model = None
-    tokenizer = None
-    backend = ""
-    use_unsloth = (
-        not args.force_peft
-        and not args.no_quant
-        and model_path == MODEL_ID
-    )
-    if use_unsloth:
-        try:
-            model, tokenizer, backend = load_model_unsloth(args.max_seq_length)
-            print("Loaded model via Unsloth")
-        except Exception as e:
-            print(f"Unsloth load failed ({e!r}); falling back to PEFT.")
-    if model is None:
-        try:
-            model, tokenizer, backend = load_model_peft(
-                model_path,
-                quantize=not args.no_quant,
-                lora_alpha=args.lora_alpha,
-                lora_target_mode=args.lora_target_mode,
-                offload_folder=offload_folder,
-                max_memory=max_memory,
-                no_auto_max_memory=args.no_auto_max_memory,
+        def run(ds, epochs_, max_steps, tag):
+            sft_cfg = make_sft_config(
+                args.output_dir, max_seq, epochs_, lr, bsz, accum,
+                **({"max_steps": max_steps} if max_steps else {}),
             )
-            q = "PEFT + 4-bit" if not args.no_quant else "PEFT + bf16 (no quant)"
-            print(f"Loaded model via {q}")
-        except Exception as e:
-            err = str(e).lower()
-            if "mamba" in err:
-                raise SystemExit(
-                    "PEFT load failed: Nemotron-3 includes Mamba layers and needs `mamba-ssm` "
-                    "(and usually `causal-conv1d`). On Kaggle, add to your pip cell:\n"
-                    "  pip install mamba-ssm causal-conv1d\n"
-                    f"Original error: {e!r}"
-                ) from e
-            if "offload_folder" in err or "offloaded to the disk" in err:
-                raise SystemExit(
-                    "PEFT load failed: MoE + device_map often needs a disk offload dir. "
-                    "This script defaults to <checkpoint-dir>/hf_offload; set explicitly with:\n"
-                    "  --offload-folder /kaggle/working/project/lora_output/hf_offload\n"
-                    "Or drop --no-quant to use 4-bit QLoRA and reduce GPU/disk offload.\n"
-                    f"Original error: {e!r}"
-                ) from e
-            if "not a valid model identifier" in err or "is not a local folder" in err:
-                raise SystemExit(
-                    "PEFT load failed: Hugging Face could not load this --model-path.\n"
-                    "On Kaggle, add the competition **Model** input (mounts under /kaggle/input/models/...) "
-                    "or set env NEMOTRON_MODEL_PATH to a folder containing config.json.\n"
-                    "This script auto-searches /kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/.\n"
-                    f"Original error: {e!r}"
-                ) from e
-            if "out of memory" in err:
-                raise SystemExit(
-                    "PEFT load failed: CUDA OOM while loading weights.\n"
-                    "1) Pin transformers 4.x (v5 can materialize FP weights on GPU before 4-bit quant — "
-                    "max_memory may not help):  pip install -U 'transformers>=4.45,<5'\n"
-                    "2) Integer GPU keys in max_memory (script auto-sets this). Tighten further, e.g.\n"
-                    '     --max-memory-json \'{"0":"2GiB","cpu":"200GiB","disk":"120GiB"}\'\n'
-                    "3) Avoid --no-quant on T4.\n"
-                    f"Original error: {e!r}"
-                ) from e
+            kw = {}
+            if collator is not None:
+                kw["data_collator"] = collator
+            trainer = SFTTrainer(
+                model=model, args=sft_cfg, train_dataset=ds,
+                processing_class=tok, **kw,
+            )
+            print(f"[lora] === {tag} ===")
+            trainer.train()
+            return trainer
+
+        # 1) smoke test: 1% of data, 10 steps, to prove the memory config fits
+        if not args.no_smoke:
+            k = max(8, len(full_ds) // 100)
+            smoke_ds = full_ds.shuffle(seed=seed).select(range(min(k, len(full_ds))))
+            run(smoke_ds, 1, 10, f"SMOKE TEST ({len(smoke_ds)} rows, 10 steps)")
+            print("[lora] smoke test passed: memory config fits.")
+            mins = probe(model)
+            print("[lora] post-smoke min-logprob by category:",
+                  {c: round(v, 3) for c, v in mins.items()})
+            if args.smoke_only:
+                return
+
+        # 2) full run
+        run(full_ds, epochs, 0, f"FULL TRAIN ({len(full_ds)} rows, {epochs} epochs)")
+
+        mins = probe(model)
+        print("\n[lora] FINAL min-logprob by category:")
+        not_converged = []
+        for c in sorted(mins):
+            flag = (" <-- not approaching 0 (upweight next round)"
+                    if mins[c] < probe.threshold else "")
+            if flag:
+                not_converged.append(c)
+            print(f"    {c:18s} {mins[c]:8.3f}{flag}")
+        if not_converged:
+            print(f"[lora] upweight-next candidates: {not_converged}")
+
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(str(args.output_dir))
+        tok.save_pretrained(str(args.output_dir))
+        print(f"[lora] saved adapter -> {args.output_dir}")
+
+    except (RuntimeError, MemoryError) as e:
+        traceback.print_exc()
+        if is_oom(e):
+            write_fallback_md(str(e), cfg)
             raise SystemExit(
-                f"PEFT load failed ({e!r}).\n"
-                "If you still see 'provide offload_folder' or 'Try --force-peft', your Kaggle copy of "
-                "scripts/03_train_lora.py is OUTDATED — re-upload the dataset and re-run Bootstrap.\n"
-                "Otherwise try: explicit --offload-folder, --max-memory-json, or remove --no-quant."
-            ) from e
-
-    def formatting_func(example):
-        return tokenizer.apply_chat_template(
-            example["messages"],
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-
-    common_kwargs = dict(
-        output_dir=str(args.checkpoint_dir),
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.grad_accum,
-        warmup_ratio=0.05,
-        num_train_epochs=args.epochs,
-        learning_rate=args.lr,
-        bf16=torch.cuda.is_available(),
-        fp16=False,
-        gradient_checkpointing=torch.cuda.is_available(),
-        logging_steps=10,
-        optim="adamw_torch",
-        weight_decay=0.01,
-        lr_scheduler_type="cosine",
-        seed=args.seed,
-        save_strategy="epoch",
-        save_total_limit=3,
-        report_to=report_to,
-        dataloader_num_workers=args.dataloader_workers,
-    )
-    if hasattr(TrainingArguments, "eval_strategy"):
-        common_kwargs["eval_strategy"] = "epoch"
-        common_kwargs["load_best_model_at_end"] = True
-        common_kwargs["metric_for_best_model"] = "eval_loss"
-    else:
-        common_kwargs["evaluation_strategy"] = "epoch"
-        common_kwargs["load_best_model_at_end"] = True
-        common_kwargs["metric_for_best_model"] = "eval_loss"
-
-    cfg_kw = {**common_kwargs, **_sft_config_kwargs(args.max_seq_length)}
-    cfg_kw = _kwargs_for_callable(SFTConfig.__init__, cfg_kw)
-    try:
-        training_args = SFTConfig(**cfg_kw)
-    except TypeError:
-        cfg_kw.pop("packing", None)
-        training_args = SFTConfig(**cfg_kw)
-
-    trainer_kwargs = dict(
-        model=model,
-        args=training_args,
-        train_dataset=ds["train"],
-        eval_dataset=ds["test"],
-        formatting_func=formatting_func,
-    )
-    try:
-        trainer = SFTTrainer(**trainer_kwargs, processing_class=tokenizer)
-    except TypeError:
-        trainer = SFTTrainer(**trainer_kwargs, tokenizer=tokenizer)
-
-    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-    print(
-        "Starting trainer.train() — the progress bar may stay at 0% for a long time on the "
-        "**first** step (MoE + disk offload + first backward). If it never moves after ~30–60 min, "
-        "set --dataloader-workers 0 and ensure GPU RAM is not thrashing.",
-        flush=True,
-    )
-    trainer.train()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(str(args.output_dir))
-    tokenizer.save_pretrained(str(args.output_dir))
-    _ensure_base_model_in_adapter(args.output_dir, args.adapter_base_name)
-    print(f"Saved LoRA adapter to {args.output_dir} (backend={backend})")
+                "OOM after offload tuning. Wrote FALLBACK.md — run the identical "
+                "config on a rented A100/H100 and copy lora_adapter/ back."
+            )
+        raise
 
 
 if __name__ == "__main__":
