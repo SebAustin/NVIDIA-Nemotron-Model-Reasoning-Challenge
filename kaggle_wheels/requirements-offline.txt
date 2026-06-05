@@ -1,0 +1,9 @@
+transformers<5
+peft
+trl
+datasets
+accelerate
+bitsandbytes
+psutil
+safetensors
+sentencepiece

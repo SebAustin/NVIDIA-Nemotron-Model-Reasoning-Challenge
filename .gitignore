@@ -39,3 +39,8 @@ submission.zip
 
 # Local agent/session config
 .claude/
+
+# Offline wheels for Kaggle: ignore the large binaries, keep the helper scripts
+kaggle_wheels/*.whl
+kaggle_wheels/*.zip
+kaggle_wheels/*.tar.gz
