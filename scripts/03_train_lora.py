@@ -111,11 +111,13 @@ def resolve_model_source() -> str:
     return MODEL_ID
 
 
-def load_base_model(offload_dir: Path, model_src: str, load_8bit: bool = True):
+def load_base_model(offload_dir: Path, model_src: str, quant: str = "8bit"):
+    """quant: 'none' (bf16, big GPU), '8bit' (2xT4 + offload), '4bit' (NF4 QLoRA,
+    fits a single 40GB A100; compute in bf16 so dtypes stay consistent)."""
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-    print(f"[lora] loading base model from: {model_src} (8bit={load_8bit})")
+    print(f"[lora] loading base model from: {model_src} (quant={quant})")
     tok = AutoTokenizer.from_pretrained(model_src, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -129,13 +131,19 @@ def load_base_model(offload_dir: Path, model_src: str, load_8bit: bool = True):
         attn_implementation="eager",
         torch_dtype=torch.bfloat16,
     )
-    if load_8bit:
-        # 2x T4 path: 8-bit + CPU offload (4-bit is unreliable on this hybrid model)
+    if quant == "8bit":
         kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_8bit=True,
             llm_int8_enable_fp32_cpu_offload=True,
         )
-    # else: bf16 weights straight onto a big GPU (A100/H100) — faster, no int8 materialize
+    elif quant == "4bit":
+        kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,  # keep MoE math in bf16
+        )
+    # else 'none': bf16 weights straight onto a big GPU (A100/H100 80GB)
     model = AutoModelForCausalLM.from_pretrained(model_src, **kwargs)
     model.config.use_cache = False
     return model, tok
@@ -159,22 +167,21 @@ def verify_target_modules(model, regex: str) -> List[str]:
     return matched
 
 
-def build_peft_model(model, r: int, alpha: int, target_regex: str, load_8bit: bool):
-    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+def build_peft_model(model, r: int, alpha: int, target_regex: str):
+    from peft import LoraConfig, get_peft_model
 
-    if load_8bit:
-        # int8 training needs fp32 upcasting of norms/LoRA for stability
-        model = prepare_model_for_kbit_training(
-            model, use_gradient_checkpointing=True
-        )
-        autocast_adapter = True
-    else:
-        # pure bf16: keep the LoRA adapter in bf16 so the MoE residual add does
-        # not mix bf16 (stream) with fp32 (adapter output) -> index_add_ dtype error
-        model.gradient_checkpointing_enable()
-        if hasattr(model, "enable_input_require_grads"):
-            model.enable_input_require_grads()
-        autocast_adapter = False
+    # NOTE: deliberately NOT calling prepare_model_for_kbit_training. It upcasts
+    # layernorms to fp32, which makes this model's custom MoE add a fp32 expert
+    # output into the bf16 residual stream (index_add_ dtype error). We set up
+    # gradient checkpointing + input grads manually and keep the adapter in bf16
+    # (autocast_adapter_dtype=False) so EVERYTHING stays bf16 — works for 4bit /
+    # 8bit / bf16 alike.
+    model.config.use_cache = False
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
     cfg = LoraConfig(
         r=r,
         lora_alpha=alpha,
@@ -183,7 +190,7 @@ def build_peft_model(model, r: int, alpha: int, target_regex: str, load_8bit: bo
         bias="none",
         task_type="CAUSAL_LM",
     )
-    model = get_peft_model(model, cfg, autocast_adapter_dtype=autocast_adapter)
+    model = get_peft_model(model, cfg, autocast_adapter_dtype=False)
     model.print_trainable_parameters()
     return model
 
@@ -353,13 +360,17 @@ def main() -> None:
     ap.add_argument("--model-path", type=str, default=None,
                     help="Base model dir/HF id. Default: MODEL_PATH env, else a "
                          "Kaggle model mount if found, else the HF id.")
+    ap.add_argument("--quant", choices=["none", "8bit", "4bit"], default=None,
+                    help="Quantization: none=bf16 (80GB GPU), 8bit (2xT4+offload), "
+                         "4bit=NF4 QLoRA (fits one 40GB A100). Default: QUANT env, "
+                         "else 8bit; --no-8bit forces none.")
     ap.add_argument("--no-8bit", action="store_true",
-                    help="Load bf16 weights directly (big GPU, e.g. A100/H100).")
+                    help="Alias for --quant none (load bf16 on a big GPU).")
     ap.add_argument("--no-smoke", action="store_true", help="Skip the smoke test.")
     ap.add_argument("--smoke-only", action="store_true")
     args = ap.parse_args()
     model_src = args.model_path or resolve_model_source()
-    load_8bit = not args.no_8bit and os.environ.get("LOAD_8BIT", "1") != "0"
+    quant = args.quant or os.environ.get("QUANT") or ("none" if args.no_8bit else "8bit")
 
     r = min(int(os.environ.get("LORA_R", "16")), 32)
     alpha = int(os.environ.get("LORA_ALPHA", str(2 * r)))
@@ -371,7 +382,8 @@ def main() -> None:
     accum = int(os.environ.get("GRAD_ACCUM", "16"))
     seed = int(os.environ.get("SEED", "42"))
     cfg = {"r": r, "alpha": alpha, "max_seq": max_seq, "target_regex": target_regex,
-           "epochs": epochs, "lr": lr, "bsz": bsz, "accum": accum, "seed": seed}
+           "epochs": epochs, "lr": lr, "bsz": bsz, "accum": accum, "seed": seed,
+           "quant": quant}
     print("[lora] config:", json.dumps(cfg, indent=2))
     set_all_seeds(seed)
 
@@ -383,9 +395,9 @@ def main() -> None:
     try:
         from trl import SFTTrainer
 
-        model, tok = load_base_model(args.offload_dir, model_src, load_8bit)
+        model, tok = load_base_model(args.offload_dir, model_src, quant)
         verify_target_modules(model, target_regex)
-        model = build_peft_model(model, r, alpha, target_regex, load_8bit)
+        model = build_peft_model(model, r, alpha, target_regex)
         full_ds = to_text_dataset(records, tok)
         collator = completion_collator(tok)
         probe = PerCategoryLogprobProbe(tok, records)
