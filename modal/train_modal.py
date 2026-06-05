@@ -28,18 +28,17 @@ import modal
 
 REPO = "https://github.com/SebAustin/NVIDIA-Nemotron-Model-Reasoning-Challenge"
 BRANCH = "build/nemotron-pipeline"
-TORCH = "torch==2.6.0"          # cu124
+TORCH = "torch==2.7.0"          # 2.7+ Linux wheels are cxx11abi=TRUE (provides the
+                                # __cxx11 c10 symbols the mamba wheels need; 2.6 is abiFALSE)
 
-# Prebuilt mamba/causal-conv1d wheels for torch 2.6 cp312. Use the cxx11abi=TRUE
-# variant: the abiFALSE wheel fails at runtime with an undefined __cxx11 c10 symbol,
-# i.e. this torch build needs the TRUE-abi wheel. Verified by importing at build.
+# Prebuilt mamba/causal-conv1d wheels for torch 2.7 cp312, cxx11abi=TRUE.
 _GH = "https://github.com/{}/releases/download/{}/{}"
 CAUSAL_WHL = _GH.format(
     "Dao-AILab/causal-conv1d", "v1.6.2.post1",
-    "causal_conv1d-1.6.2.post1+cu12torch2.6cxx11abiTRUE-cp312-cp312-linux_x86_64.whl")
+    "causal_conv1d-1.6.2.post1+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl")
 MAMBA_WHL = _GH.format(
     "state-spaces/mamba", "v2.3.2.post1",
-    "mamba_ssm-2.3.2.post1+cu12torch2.6cxx11abiTRUE-cp312-cp312-linux_x86_64.whl")
+    "mamba_ssm-2.3.2.post1+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl")
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
