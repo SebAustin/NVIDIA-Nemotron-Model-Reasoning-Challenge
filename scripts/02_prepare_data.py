@@ -1,298 +1,193 @@
 #!/usr/bin/env python3
-"""Phase 2: Build train_sft.jsonl from train CSV (optional API CoT) + synthetic shards."""
+"""Phase 2: Build data/train_sft.jsonl (no external API).
+
+Pipeline:
+  * Real train rows -> family from category. For solvable families we attach a
+    solver-VERIFIED reasoning trace (rule stated, applied, answer). Hard-family
+    rows (bit_manipulation, equation) and any solver miss become direct-answer
+    examples anchored on the gold answer.
+  * Synthetic puzzles (puzzle_generator) add reasoning traces with KNOWN rules
+    for all 6 families; hard families are upweighted.
+  * Enforce a ~75% reasoning / 25% direct-answer mix (preserve base reasoning),
+    dedup, optional token-length filter, shuffle, write JSONL of {messages,meta}.
+
+Each example is verified consistent with the gold answer before inclusion.
+"""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
-import os
+import random
 import re
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, List, Optional
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 import pandas as pd
-from tqdm import tqdm
-from transformers import AutoTokenizer
 
-from scripts.utils.answer_extractor import answers_match, extract_boxed_answer
-from scripts.utils.cot_generator import generate_cot_with_verification
+from scripts.utils.cot_generator import build_reasoning
+from scripts.utils.competition_metric import scores
 from scripts.utils.data_formatter import build_messages, format_assistant_reply
 from scripts.utils.puzzle_generator import write_all_synthetic
+from scripts.utils.solvers import (
+    FAMILIES,
+    build_encryption_vocab,
+    classify_family,
+    solve,
+)
 
-MODEL_ID = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+# hard families to upweight (their real rows aren't deterministically solvable)
+HARD = {"bit_manipulation", "equation"}
 
 
-def normalize_prompt_key(user_text: str) -> str:
-    t = user_text.strip().lower()
-    t = re.sub(r"\s+", " ", t)
-    return t
-
-
-def fingerprint_record(messages: List[Dict[str, str]]) -> str:
+def _fingerprint(messages: List[Dict[str, str]]) -> str:
     user = next((m["content"] for m in messages if m["role"] == "user"), "")
-    h = hashlib.sha1(normalize_prompt_key(user).encode("utf-8")).hexdigest()
-    return h
+    return hashlib.sha1(re.sub(r"\s+", " ", user.strip().lower()).encode()).hexdigest()
 
 
-def count_tokens_chat(tokenizer, messages: List[Dict[str, str]]) -> int:
-    try:
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-    except Exception:
-        text = "\n\n".join(f"{m['role']}: {m['content']}" for m in messages)
-    return len(tokenizer(text, add_special_tokens=False)["input_ids"])
+def _example(prompt: str, answer: str, reasoning: Optional[str], category: str,
+             source: str, rid: str = "") -> Dict[str, Any]:
+    assistant = format_assistant_reply(reasoning or "", answer)
+    return {
+        "messages": build_messages(prompt, assistant),
+        "meta": {"category": category, "source": source, "id": rid,
+                 "reasoning": bool(reasoning), "answer": answer},
+    }
 
 
-def infer_puzzle_type_from_meta(rec: Dict[str, Any]) -> str:
-    meta = rec.get("meta") or {}
-    if isinstance(meta, dict) and meta.get("puzzle_type"):
-        return str(meta["puzzle_type"])
-    user = next(
-        (m["content"] for m in rec["messages"] if m["role"] == "user"),
-        "",
-    )
-    t = user.lower()
-    if "bit manipulation" in t or "binary string" in t:
-        return "bit_manipulation"
-    if "cipher" in t or "library" in t:
-        return "text_cipher"
-    if "sequence" in t or "next term" in t:
-        return "sequence"
-    if "f(" in t or "numeric puzzle" in t:
-        return "algebraic"
-    return "other"
-
-
-def balance_records(
-    records: List[Dict[str, Any]],
-    max_per_type: int,
-) -> List[Dict[str, Any]]:
-    rng_groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for r in records:
-        ptype = infer_puzzle_type_from_meta(r)
-        rng_groups[ptype].append(r)
-    out: List[Dict[str, Any]] = []
-    for ptype, items in rng_groups.items():
-        items = items[:max_per_type]
-        out.extend(items)
-    return out
-
-
-def load_jsonl(path: Path) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
+def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
+    rows = []
     with path.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if not line:
-                continue
-            rows.append(json.loads(line))
+            if line:
+                rows.append(json.loads(line))
     return rows
 
 
-def save_jsonl(path: Path, records: Iterable[Dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        for r in records:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+def _char_len(messages: List[Dict[str, str]]) -> int:
+    return sum(len(m["content"]) for m in messages)
 
 
-def row_from_csv(
-    row: pd.Series,
-    cot_text: str,
-    gold: str,
-    puzzle_type: str,
-) -> Dict[str, Any]:
-    prompt = str(row["prompt"])
-    assistant = format_assistant_reply(cot_text, str(gold).strip())
-    rec: Dict[str, Any] = {
-        "messages": build_messages(prompt, assistant),
-        "meta": {
-            "puzzle_type": puzzle_type,
-            "source": "train_csv",
-            "id": str(row.get("id", "")),
-        },
-    }
-    return rec
+def build_real_examples(df: pd.DataFrame, vocab: set) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    stats = Counter()
+    for _, row in df.iterrows():
+        prompt = str(row["prompt"])
+        answer = str(row["answer"]).strip()
+        fam = str(row.get("category") or classify_family(prompt))
+        reasoning = None
+        if fam not in HARD:
+            pred = solve(prompt, fam, vocab=vocab)
+            if pred is not None and scores(answer, str(pred)):
+                reasoning = build_reasoning(prompt, fam, answer)
+        out.append(_example(prompt, answer, reasoning, fam, "train_csv",
+                            str(row.get("id", ""))))
+        stats[(fam, "reasoning" if reasoning else "direct")] += 1
+    for fam in FAMILIES:
+        r = stats[(fam, "reasoning")]
+        d = stats[(fam, "direct")]
+        print(f"  real {fam:18s} reasoning={r:5d} direct={d:5d}")
+    return out
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Prepare SFT JSONL")
-    parser.add_argument("--data-dir", type=Path, default=Path("data"))
-    parser.add_argument(
-        "--train-categorized",
-        type=Path,
-        default=None,
-        help="Default: <data-dir>/train_categorized.csv",
-    )
-    parser.add_argument("--synthetic-dir", type=Path, default=Path("data/synthetic"))
-    parser.add_argument("--output", type=Path, default=Path("data/train_sft.jsonl"))
-    parser.add_argument("--tokenizer-model", type=str, default=MODEL_ID)
-    parser.add_argument("--max-tokens-per-example", type=int, default=7000)
-    parser.add_argument("--max-per-type", type=int, default=2000)
-    parser.add_argument("--synthetic-per-kind", type=int, default=250)
-    parser.add_argument("--skip-cot", action="store_true", help="Skip API CoT on real train")
-    parser.add_argument(
-        "--synthetic-only",
-        action="store_true",
-        help="Alias for --skip-cot (compat with older Kaggle notebooks).",
-    )
-    parser.add_argument(
-        "--max-cot",
-        type=int,
-        default=None,
-        help="Alias for --limit-train (max train rows when using API CoT).",
-    )
-    parser.add_argument(
-        "--bit",
-        type=int,
-        default=None,
-        help="Synthetic count for bit_manipulation (default: --synthetic-per-kind).",
-    )
-    parser.add_argument(
-        "--cipher",
-        type=int,
-        default=None,
-        help="Synthetic count for text_cipher.",
-    )
-    parser.add_argument(
-        "--algebraic",
-        type=int,
-        default=None,
-        help="Synthetic count for algebraic.",
-    )
-    parser.add_argument(
-        "--sequence",
-        type=int,
-        default=None,
-        help="Synthetic count for sequence.",
-    )
-    parser.add_argument(
-        "--cot-backend",
-        choices=["anthropic", "openai"],
-        default="anthropic",
-    )
-    parser.add_argument(
-        "--cot-model",
-        type=str,
-        default="claude-sonnet-4-20250514",
-    )
-    parser.add_argument("--cot-max-tokens", type=int, default=4096)
-    parser.add_argument("--limit-train", type=int, default=0, help="0 = all rows")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Prepare SFT JSONL")
+    ap.add_argument("--data-dir", type=Path, default=Path("data"))
+    ap.add_argument("--train-categorized", type=Path, default=None)
+    ap.add_argument("--synthetic-dir", type=Path, default=Path("data/synthetic"))
+    ap.add_argument("--output", type=Path, default=Path("data/train_sft.jsonl"))
+    ap.add_argument("--synthetic-per-kind", type=int, default=300)
+    ap.add_argument("--hard-multiplier", type=float, default=3.0,
+                    help="Synthetic upweight factor for hard families.")
+    ap.add_argument("--direct-ratio", type=float, default=0.25,
+                    help="Target fraction of direct-answer (no-reasoning) examples.")
+    ap.add_argument("--max-chars", type=int, default=6000,
+                    help="Drop examples whose rendered messages exceed this length.")
+    ap.add_argument("--limit-train", type=int, default=0, help="0 = all rows")
+    ap.add_argument("--seed", type=int, default=42)
+    args = ap.parse_args()
 
-    if args.synthetic_only:
-        args.skip_cot = True
-    if args.max_cot is not None:
-        args.limit_train = args.max_cot
-
-    if not args.skip_cot:
-        env_key = (
-            "ANTHROPIC_API_KEY"
-            if args.cot_backend == "anthropic"
-            else "OPENAI_API_KEY"
-        )
-        if not os.environ.get(env_key):
-            raise SystemExit(
-                f"Missing {env_key}. Set it or use --skip-cot for synthetic-only data."
-            )
-
+    rng = random.Random(args.seed)
     data_dir = args.data_dir
     train_cat = args.train_categorized or (data_dir / "train_categorized.csv")
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.tokenizer_model,
-        trust_remote_code=True,
+    src = train_cat if train_cat.is_file() else (data_dir / "train.csv")
+    df = pd.read_csv(src)
+    if "category" not in df.columns:
+        df["category"] = df["prompt"].map(classify_family)
+    if args.limit_train > 0:
+        df = df.head(args.limit_train)
+    print(f"Loaded {len(df)} real rows from {src}")
+
+    vocab = build_encryption_vocab(
+        df[df.category == "encryption"]["prompt"].tolist()
     )
 
-    overrides: Dict[str, int] = {}
-    if args.bit is not None:
-        overrides["bit_manipulation"] = args.bit
-    if args.cipher is not None:
-        overrides["text_cipher"] = args.cipher
-    if args.algebraic is not None:
-        overrides["algebraic"] = args.algebraic
-    if args.sequence is not None:
-        overrides["sequence"] = args.sequence
+    print("Building real examples...")
+    real = build_real_examples(df, vocab)
 
-    paths = write_all_synthetic(
-        args.synthetic_dir,
-        per_kind=args.synthetic_per_kind,
-        seed=42,
-        per_kind_overrides=overrides or None,
-    )
-    synthetic_records: List[Dict[str, Any]] = []
+    print("Generating synthetic examples...")
+    overrides = {f: int(args.synthetic_per_kind * args.hard_multiplier) for f in HARD}
+    paths = write_all_synthetic(args.synthetic_dir, per_kind=args.synthetic_per_kind,
+                                seed=args.seed, per_kind_overrides=overrides)
+    synthetic: List[Dict[str, Any]] = []
     for p in paths.values():
-        if p.is_file():
-            synthetic_records.extend(load_jsonl(p))
-    print(f"Synthetic examples: {len(synthetic_records)}")
+        synthetic.extend(_load_jsonl(p))
+    print(f"  synthetic total={len(synthetic)}")
 
-    api_records: List[Dict[str, Any]] = []
-    if not args.skip_cot:
-        if not train_cat.is_file():
-            raise SystemExit(
-                f"Missing {train_cat}. Run 01_eda.py first or pass --skip-cot."
-            )
-        df = pd.read_csv(train_cat)
-        if args.limit_train > 0:
-            df = df.head(args.limit_train)
-        for _, row in tqdm(df.iterrows(), total=len(df), desc="CoT (API)"):
-            gold = str(row["answer"]).strip()
-            puzzle_type = str(row.get("puzzle_type", "other"))
-            try:
-                res = generate_cot_with_verification(
-                    str(row["prompt"]),
-                    gold,
-                    backend=args.cot_backend,
-                    model=args.cot_model,
-                    max_tokens=args.cot_max_tokens,
-                )
-            except Exception as e:
-                print(f"CoT row failed (id={row.get('id')}): {e!r}")
-                continue
-            if res.extracted is None or not answers_match(gold, res.extracted):
-                continue
-            cot_only = res.raw_text
-            if "\\boxed" in cot_only:
-                cot_only = cot_only.split("\\boxed")[0].rstrip()
-            rec = row_from_csv(row, cot_only, gold, puzzle_type)
-            api_records.append(rec)
-        print(f"API-verified examples: {len(api_records)}")
-    else:
-        print("Skipping API CoT (--skip-cot).")
-
-    merged = synthetic_records + api_records
-    seen: set[str] = set()
-    deduped: List[Dict[str, Any]] = []
+    # dedup + length filter
+    merged = real + synthetic
+    seen: set = set()
+    kept: List[Dict[str, Any]] = []
     for r in merged:
-        msgs = r.get("messages")
-        if not isinstance(msgs, list):
-            continue
-        fp = fingerprint_record(msgs)
+        fp = _fingerprint(r["messages"])
         if fp in seen:
             continue
+        if _char_len(r["messages"]) > args.max_chars:
+            continue
         seen.add(fp)
-        deduped.append(r)
+        kept.append(r)
 
-    filtered: List[Dict[str, Any]] = []
-    for r in tqdm(deduped, desc="Token filter"):
-        ntok = count_tokens_chat(tokenizer, r["messages"])
-        if ntok <= args.max_tokens_per_example:
-            filtered.append(r)
+    # enforce reasoning/direct ratio by downsampling the over-represented side
+    reasoning = [r for r in kept if r["meta"]["reasoning"]]
+    direct = [r for r in kept if not r["meta"]["reasoning"]]
+    target_direct_frac = args.direct_ratio
+    total = len(reasoning) + len(direct)
+    max_direct = int(target_direct_frac * total)
+    if len(direct) > max_direct:
+        rng.shuffle(direct)
+        direct = direct[:max_direct]
+    # if too few direct, convert a slice of reasoning rows to direct-answer
+    elif len(direct) < max_direct:
+        need = max_direct - len(direct)
+        rng.shuffle(reasoning)
+        convert, reasoning = reasoning[:need], reasoning[need:]
+        for r in convert:
+            ans = r["meta"]["answer"]
+            r["messages"][-1]["content"] = format_assistant_reply("", ans)
+            r["meta"]["reasoning"] = False
+            direct.append(r)
 
-    balanced = balance_records(filtered, args.max_per_type)
-    counts = Counter(infer_puzzle_type_from_meta(x) for x in balanced)
-    print("Final counts by type:", dict(counts))
-    save_jsonl(args.output, balanced)
-    print(f"Wrote {args.output} ({len(balanced)} rows)")
+    final = reasoning + direct
+    rng.shuffle(final)
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with args.output.open("w", encoding="utf-8") as f:
+        for r in final:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    by_cat = Counter(r["meta"]["category"] for r in final)
+    print(f"\nWrote {args.output} ({len(final)} rows)")
+    print(f"  reasoning={len(reasoning)}  direct={len(direct)}  "
+          f"({len(direct)/max(1,len(final)):.1%} direct)")
+    print("  by category:", dict(by_cat))
 
 
 if __name__ == "__main__":

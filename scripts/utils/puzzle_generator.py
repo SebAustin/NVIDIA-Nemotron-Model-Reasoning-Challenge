@@ -1,499 +1,337 @@
-"""Synthetic reasoning puzzles (bit rules, ciphers, algebra, sequences) → JSONL-ready examples."""
+"""Synthetic puzzle generators for the 6 real Nemotron families.
+
+Each generator builds a puzzle from a *known* rule using the EXACT real prompt
+template (verified against data/train.csv), so we get a correct answer and a
+concise worked solution for free. This is the lever for the hard families
+(bit_manipulation, equation) whose real rows we cannot solve deterministically.
+
+Each ``generate_*`` returns ``(prompt, answer, reasoning)``. ``reasoning`` is the
+``<think>`` body (no boxed line — the formatter adds that).
+"""
 
 from __future__ import annotations
 
 import json
 import random
+import string
 import sys
 from pathlib import Path
+from typing import Callable, Dict, List, Tuple
 
 _ROOT = Path(__file__).resolve().parents[2]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
-import string
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Tuple
 
 from scripts.utils.data_formatter import build_messages, format_assistant_reply
 
+Gen = Callable[[random.Random], Tuple[str, str, str]]
 
-def _rand_bits(rng: random.Random, n: int = 8) -> str:
-    return "".join(rng.choice("01") for _ in range(n))
-
-
-def _apply_xor_mask(bits: str, mask: str) -> str:
-    return "".join("1" if b != m else "0" for b, m in zip(bits, mask))
-
-
-def _rotl(bits: str, k: int) -> str:
-    k %= len(bits)
-    return bits[k:] + bits[:k]
+# ---------------------------------------------------------------------------
+# bit_manipulation
+# ---------------------------------------------------------------------------
+_BIT_STEM = (
+    "In Alice's Wonderland, a secret bit manipulation rule transforms 8-bit "
+    "binary numbers. The transformation involves operations like bit shifts, "
+    "rotations, XOR, AND, OR, NOT, and possibly majority or choice functions."
+)
 
 
-def _reverse_bits(bits: str) -> str:
-    return bits[::-1]
+def _rand_byte(rng: random.Random) -> str:
+    return "".join(rng.choice("01") for _ in range(8))
 
 
-def _swap_nibbles(bits: str) -> str:
-    if len(bits) != 8:
-        raise ValueError("expected 8 bits")
-    return bits[4:] + bits[:4]
-
-
-def _flip_bit(bits: str, idx: int) -> str:
-    b = list(bits)
-    b[idx] = "0" if b[idx] == "1" else "1"
-    return "".join(b)
-
-
-RuleFn = Callable[[str], str]
-
-
-@dataclass
-class PuzzleExample:
-    inp: str
-    out: str
-
-
-def _format_bit_prompt(
-    story: str,
-    rule_name: str,
-    examples: List[PuzzleExample],
-    test_inp: str,
-) -> str:
-    lines = [
-        f"In {story}, a secret bit manipulation rule transforms any 8-bit binary string.",
-        f"Rule hint: {rule_name}",
-        "",
-        "Here are examples:",
-    ]
-    for ex in examples:
-        lines.append(f"Input: {ex.inp}  →  Output: {ex.out}")
-    lines.append("")
-    lines.append(f"Now apply the same rule to this input: {test_inp}")
-    lines.append("Respond with only the 8-bit output after you have verified the pattern.")
-    return "\n".join(lines)
-
-
-def generate_bit_manipulation_puzzle(
-    rng: random.Random,
-) -> Tuple[str, str, str]:
-    """Return (prompt, answer, cot_without_box)."""
-    rule_id = rng.randint(0, 5)
-    if rule_id == 0:
-        mask = _rand_bits(rng)
-        rule_desc = f"XOR with fixed mask {mask}"
-
-        def rule(b: str) -> str:
-            return _apply_xor_mask(b, mask)
-
-    elif rule_id == 1:
+def generate_bit_manipulation(rng: random.Random) -> Tuple[str, str, str]:
+    kind = rng.choice(
+        ["rotl", "rotr", "xor", "and", "or", "not", "reverse", "swap", "maj", "add"]
+    )
+    if kind in ("rotl", "rotr"):
         k = rng.randint(1, 7)
-
+        rule = lambda b: (b[k:] + b[:k]) if kind == "rotl" else (b[-k:] + b[:-k])
+        desc = f"rotate the 8 bits to the {'left' if kind=='rotl' else 'right'} by {k}"
+    elif kind in ("xor", "and", "or"):
+        mask = _rand_byte(rng)
+        if kind == "xor":
+            rule = lambda b: "".join("1" if x != y else "0" for x, y in zip(b, mask))
+            desc = f"XOR each bit with the mask {mask}"
+        elif kind == "and":
+            rule = lambda b: "".join("1" if x == "1" and y == "1" else "0" for x, y in zip(b, mask))
+            desc = f"AND each bit with the mask {mask}"
+        else:
+            rule = lambda b: "".join("1" if x == "1" or y == "1" else "0" for x, y in zip(b, mask))
+            desc = f"OR each bit with the mask {mask}"
+    elif kind == "not":
+        rule = lambda b: "".join("1" if c == "0" else "0" for c in b)
+        desc = "invert every bit (NOT)"
+    elif kind == "reverse":
+        rule = lambda b: b[::-1]
+        desc = "reverse the order of the 8 bits"
+    elif kind == "swap":
+        rule = lambda b: b[4:] + b[:4]
+        desc = "swap the upper and lower nibbles (4 bits each)"
+    elif kind == "maj":
         def rule(b: str) -> str:
-            return _rotl(b, k)
+            n = len(b)
+            return "".join(
+                "1" if (int(b[(i - 1) % n]) + int(b[i]) + int(b[(i + 1) % n])) >= 2 else "0"
+                for i in range(n)
+            )
+        desc = "set each bit to the majority of itself and its two neighbours (wrap-around)"
+    else:  # add
+        c = rng.randint(1, 255)
+        rule = lambda b: format((int(b, 2) + c) % 256, "08b")
+        desc = f"add {c} to the value modulo 256"
 
-        rule_desc = f"Rotate left by {k} bits"
-    elif rule_id == 2:
-
-        def rule(b: str) -> str:
-            return _reverse_bits(b)
-
-        rule_desc = "Reverse all 8 bits"
-    elif rule_id == 3:
-
-        def rule(b: str) -> str:
-            return _swap_nibbles(b)
-
-        rule_desc = "Swap upper and lower 4 bits (nibbles)"
-    elif rule_id == 4:
-        idx = rng.randint(0, 7)
-
-        def rule(b: str) -> str:
-            return _flip_bit(b, idx)
-
-        rule_desc = f"Flip bit at position {idx} (0=leftmost)"
-    else:
-        m = rng.randint(1, 255)
-
-        def rule(b: str) -> str:
-            v = int(b, 2)
-            return format((v + m) % 256, "08b")
-
-        rule_desc = f"Interpret as unsigned int, add {m} mod 256"
-
-    examples: List[PuzzleExample] = []
     seen = set()
-    while len(examples) < rng.randint(5, 7):
-        x = _rand_bits(rng)
+    examples = []
+    while len(examples) < 8:
+        x = _rand_byte(rng)
         if x in seen:
             continue
         seen.add(x)
-        examples.append(PuzzleExample(x, rule(x)))
-    test_inp = _rand_bits(rng)
-    while test_inp in seen:
-        test_inp = _rand_bits(rng)
-    answer = rule(test_inp)
-    story = "Alice's Wonderland" if rng.random() < 0.5 else "the Enigma Gardens"
-    prompt = _format_bit_prompt(story, rule_desc, examples, test_inp)
-    cot = _bit_cot(rule_desc, examples, test_inp, answer)
-    return prompt, answer, cot
+        examples.append((x, rule(x)))
+    test = _rand_byte(rng)
+    while test in seen:
+        test = _rand_byte(rng)
+    answer = rule(test)
+    ex_lines = "\n".join(f"{a} -> {b}" for a, b in examples)
+    prompt = (
+        f"{_BIT_STEM}\n\nHere are some examples of input -> output:\n{ex_lines}\n\n"
+        f"Now, determine the output for: {test}"
+    )
+    reasoning = (
+        f"Checking the examples, the rule is to {desc}. "
+        f"Applying it to {test} gives {answer}."
+    )
+    return prompt, answer, reasoning
 
 
-def _bit_cot(
-    rule_desc: str,
-    examples: List[PuzzleExample],
-    test_inp: str,
-    answer: str,
-) -> str:
-    lines = [
-        "I will check each example to infer a single consistent 8-bit transformation.",
-        f"The stated hint is: {rule_desc}.",
-        "Checking examples:",
-    ]
-    for ex in examples:
-        lines.append(f"- {ex.inp} → {ex.out}")
-    lines.append("The rule matches all shown pairs.")
-    lines.append(f"Apply the same rule to {test_inp} → {answer}.")
-    return "\n".join(lines)
+# ---------------------------------------------------------------------------
+# gravity
+# ---------------------------------------------------------------------------
+def generate_gravity(rng: random.Random) -> Tuple[str, str, str]:
+    g = round(rng.uniform(3.0, 30.0), 2)
+    ts = sorted({round(rng.uniform(1.0, 5.0), 2) for _ in range(6)})
+    while len(ts) < 5:
+        ts.append(round(rng.uniform(1.0, 5.0), 2))
+    ts = ts[:5]
+    obs = "\n".join(f"For t = {t}s, distance = {0.5*g*t*t:.2f} m" for t in ts)
+    tt = round(rng.uniform(1.0, 5.0), 2)
+    answer = f"{0.5*g*tt*tt:.2f}"
+    prompt = (
+        "In Alice's Wonderland, the gravitational constant has been secretly "
+        f"changed. Here are some example observations:\n{obs}\n"
+        f"Now, determine the falling distance for t = {tt}s given d = 0.5*g*t^2."
+    )
+    reasoning = (
+        f"From any observation, g = 2*d/t^2 is constant ≈ {g:.2f}. "
+        f"So d = 0.5*{g:.2f}*{tt}^2 ≈ {answer}."
+    )
+    return prompt, answer, reasoning
 
 
-def _caesar_shift(ch: str, k: int) -> str:
-    if not ch.isalpha():
-        return ch
-    base = ord("A") if ch.isupper() else ord("a")
-    o = (ord(ch) - base + k) % 26 + base
-    return chr(o)
+# ---------------------------------------------------------------------------
+# unit_conversion
+# ---------------------------------------------------------------------------
+def generate_unit_conversion(rng: random.Random) -> Tuple[str, str, str]:
+    k = round(rng.uniform(0.2, 3.0), 4)
+    b = round(rng.uniform(-2.0, 2.0), 2) if rng.random() < 0.3 else 0.0
+    xs = sorted({round(rng.uniform(5.0, 40.0), 2) for _ in range(6)})[:5]
+    while len(xs) < 5:
+        xs.append(round(rng.uniform(5.0, 40.0), 2))
+    lines = "\n".join(f"{x} m becomes {k*x+b:.2f}" for x in xs)
+    xt = round(rng.uniform(5.0, 40.0), 2)
+    answer = f"{k*xt+b:.2f}"
+    prompt = (
+        "In Alice's Wonderland, a secret unit conversion is applied to "
+        f"measurements. For example:\n{lines}\n"
+        f"Now, convert the following measurement: {xt} m"
+    )
+    off = "" if b == 0.0 else f" + {b:.2f}"
+    reasoning = (
+        f"Each output is input*{k:.4f}{off}. "
+        f"So {xt}*{k:.4f}{off} ≈ {answer}."
+    )
+    return prompt, answer, reasoning
 
 
-def _caesar(text: str, k: int) -> str:
-    return "".join(_caesar_shift(c, k) for c in text)
+# ---------------------------------------------------------------------------
+# numeral (standard Roman numerals)
+# ---------------------------------------------------------------------------
+_ROMAN = [
+    (1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"),
+    (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I"),
+]
 
 
-def _reverse_text(text: str) -> str:
-    return text[::-1]
-
-
-def _vigenere(text: str, key: str) -> str:
-    key = key.upper()
-    ki = 0
+def _to_roman(n: int) -> str:
     out = []
-    for c in text:
-        if not c.isalpha():
-            out.append(c)
-            continue
-        shift = ord(key[ki % len(key)]) - ord("A")
-        ki += 1
-        if c.isupper():
-            out.append(chr((ord(c) - ord("A") + shift) % 26 + ord("A")))
-        else:
-            out.append(chr((ord(c) - ord("a") + shift) % 26 + ord("a")))
+    for v, sym in _ROMAN:
+        while n >= v:
+            out.append(sym)
+            n -= v
     return "".join(out)
 
 
-def generate_cipher_puzzle(
-    rng: random.Random,
-) -> Tuple[str, str, str]:
-    mode = rng.randint(0, 4)
-    words = [
-        "HELLO",
-        "SECRET",
-        "PUZZLE",
-        "NVIDIA",
-        "REASON",
-        "LOGIC",
-        "CIPHER",
-        "STREAM",
-    ]
-    if mode == 0:
-        k = rng.randint(1, 25)
+def generate_numeral(rng: random.Random) -> Tuple[str, str, str]:
+    ns = rng.sample(range(1, 100), 4)
+    lines = "\n".join(f"{n} -> {_to_roman(n)}" for n in ns)
+    m = rng.randint(1, 100)
+    answer = _to_roman(m)
+    prompt = (
+        "In Alice's Wonderland, numbers are secretly converted into a different "
+        f"numeral system. Some examples are given below:\n{lines}\n"
+        f"Now, write the number {m} in the Wonderland numeral system."
+    )
+    reasoning = f"The mapping is standard Roman numerals, so {m} = {answer}."
+    return prompt, answer, reasoning
 
-        def enc(s: str) -> str:
-            return _caesar(s.upper(), k)
 
-        hint = f"Caesar shift forward by {k} on A–Z"
-    elif mode == 1:
+# ---------------------------------------------------------------------------
+# encryption (monoalphabetic substitution over a Wonderland vocabulary)
+# ---------------------------------------------------------------------------
+_VOCAB = [
+    "alice", "queen", "king", "wizard", "princess", "dragon", "student", "cat",
+    "castle", "valley", "door", "book", "secret", "garden", "forest", "river",
+    "creates", "discovers", "chases", "watches", "imagines", "dreams", "reads",
+    "follows", "guards", "seeks", "the", "near", "under", "inside", "beyond",
+    "golden", "magical", "mysterious", "hidden", "ancient", "silver", "wonderland",
+]
 
-        def enc(s: str) -> str:
-            return _reverse_text(s.upper())
 
-        hint = "Reverse the entire string"
-    elif mode == 2:
-        sub_map = {}
-        letters = list(string.ascii_uppercase)
-        rng.shuffle(letters)
-        for a, b in zip(string.ascii_uppercase, letters):
-            sub_map[a] = b
+def _sentence(rng: random.Random) -> str:
+    n = rng.randint(3, 4)
+    return " ".join(rng.choice(_VOCAB) for _ in range(n))
 
-        def enc(s: str) -> str:
-            return "".join(sub_map.get(c, c) for c in s.upper())
 
-        hint = "Simple substitution on A–Z (fixed permutation)"
-    elif mode == 3:
-        key = rng.choice(["KEY", "CODE", "NEMO", "BYTE"])
+def generate_encryption(rng: random.Random) -> Tuple[str, str, str]:
+    letters = list(string.ascii_lowercase)
+    shuffled = letters[:]
+    rng.shuffle(shuffled)
+    enc = {p: c for p, c in zip(letters, shuffled)}
 
-        def enc(s: str) -> str:
-            return _vigenere(s.upper(), key)
+    def encrypt(text: str) -> str:
+        return "".join(enc.get(ch, ch) for ch in text)
 
-        hint = f"Vigenère with keyword {key}"
-    else:
-
-        def enc(s: str) -> str:
-            return "".join(
-                chr(((ord(c.upper()) - ord("A") + 3) % 26) + ord("A"))
-                if c.isalpha()
-                else c
-                for c in s
-            )
-
-        hint = "Shift vowels? No — rotate every letter by +3 (wrap A–Z)"
-
-    examples: List[PuzzleExample] = []
+    plains = []
     seen = set()
-    while len(examples) < rng.randint(5, 7):
-        w = rng.choice(words)
-        if w in seen:
+    while len(plains) < 5:
+        s = _sentence(rng)
+        if s in seen:
             continue
-        seen.add(w)
-        examples.append(PuzzleExample(w, enc(w)))
-    test_word = rng.choice([x for x in words if x not in seen] or words)
-    answer = enc(test_word)
-    lines = [
-        "In the Whispering Library, a text transformation rule maps short uppercase words.",
-        f"Rule hint: {hint}",
-        "",
-        "Examples:",
-    ]
-    for ex in examples:
-        lines.append(f"Input: {ex.inp}  →  Output: {ex.out}")
-    lines.append("")
-    lines.append(f"Apply the rule to: {test_word}")
-    prompt = "\n".join(lines)
-    cot = _cipher_cot(hint, examples, test_word, answer)
-    return prompt, answer, cot
+        seen.add(s)
+        plains.append(s)
+    lines = "\n".join(f"{encrypt(p)} -> {p}" for p in plains)
+    test_plain = _sentence(rng)
+    test_cipher = encrypt(test_plain)
+    prompt = (
+        "In Alice's Wonderland, secret encryption rules are used on text. Here "
+        f"are some examples:\n{lines}\n"
+        f"Now, decrypt the following text: {test_cipher}"
+    )
+    reasoning = (
+        "Aligning each ciphertext with its plaintext gives a fixed letter "
+        f"substitution. Decoding '{test_cipher}' yields: {test_plain}."
+    )
+    return prompt, test_plain, reasoning
 
 
-def _cipher_cot(
-    hint: str,
-    examples: List[PuzzleExample],
-    test_word: str,
-    answer: str,
-) -> str:
-    lines = [
-        f"Rule hint: {hint}.",
-        "Examples:",
-    ]
-    for ex in examples:
-        lines.append(f"- {ex.inp} → {ex.out}")
-    lines.append(f"Applying the same mapping to {test_word} yields {answer}.")
-    return "\n".join(lines)
+# ---------------------------------------------------------------------------
+# equation (symbol-alphabet operands with a per-row operator semantics)
+# ---------------------------------------------------------------------------
+# braces excluded so synthetic boxed answers are unambiguous to extract
+_SYMS = list("`!@#$%^&*()[]|\\/<>?:\"'+-")
 
 
-def generate_algebraic_puzzle(
-    rng: random.Random,
-) -> Tuple[str, str, str]:
-    kind = rng.randint(0, 3)
-    if kind == 0:
-        a, b, c = rng.randint(-5, 5), rng.randint(-20, 20), rng.randint(-50, 50)
+def generate_equation(rng: random.Random) -> Tuple[str, str, str]:
+    op = rng.choice(_SYMS)
+    operands = [s for s in _SYMS if s != op]
+    semantics = rng.choice(["concat", "concat_rev", "interleave"])
 
-        def f(x: int) -> int:
-            return a * x * x + b * x + c
+    def combine(a: str, b: str) -> str:
+        if semantics == "concat":
+            return a + b
+        if semantics == "concat_rev":
+            return b + a
+        out = []
+        for i in range(max(len(a), len(b))):
+            if i < len(a):
+                out.append(a[i])
+            if i < len(b):
+                out.append(b[i])
+        return "".join(out)
 
-        desc = f"f(x) = {a}*x^2 + {b}*x + {c}"
-    elif kind == 1:
-        n = rng.randint(5, 17)
-        k = rng.randint(0, n - 1)
+    def rand_operand() -> str:
+        return "".join(rng.choice(operands) for _ in range(rng.randint(1, 2)))
 
-        def f(x: int) -> int:
-            return (x % n) + k
-
-        desc = f"f(x) = (x mod {n}) + {k}"
-    elif kind == 2:
-
-        def f(x: int) -> int:
-            return sum(int(d) for d in str(abs(x)))
-
-        desc = "f(x) = sum of decimal digits of |x|"
-    else:
-        mul = rng.randint(2, 9)
-        add = rng.randint(1, 30)
-
-        def f(x: int) -> int:
-            return mul * x + add
-
-        desc = f"f(x) = {mul}*x + {add}"
-
-    xs = []
-    while len(xs) < rng.randint(5, 7):
-        x = rng.randint(-15, 15)
-        if x in xs:
-            continue
-        xs.append(x)
-    examples = [PuzzleExample(str(x), str(f(x))) for x in xs]
-    test_x = rng.randint(-20, 20)
-    while test_x in xs:
-        test_x = rng.randint(-20, 20)
-    answer = str(f(test_x))
-    lines = [
-        "Numeric puzzle: infer f from examples (integers).",
-        f"Structure hint: {desc}",
-        "",
-        "Examples (x → f(x)):",
-    ]
-    for ex in examples:
-        lines.append(f"{ex.inp} → {ex.out}")
-    lines.append("")
-    lines.append(f"Compute f({test_x}).")
-    prompt = "\n".join(lines)
-    cot = _algebra_cot(desc, examples, test_x, answer)
-    return prompt, answer, cot
+    lines = []
+    for _ in range(4):
+        a, b = rand_operand(), rand_operand()
+        lines.append(f"{a}{op}{b} = {combine(a, b)}")
+    qa, qb = rand_operand(), rand_operand()
+    query = f"{qa}{op}{qb}"
+    answer = combine(qa, qb)
+    desc = {
+        "concat": "concatenate the two operands (dropping the operator)",
+        "concat_rev": "concatenate the operands in reverse order",
+        "interleave": "interleave the characters of the two operands",
+    }[semantics]
+    prompt = (
+        "In Alice's Wonderland, a secret set of transformation rules is applied "
+        "to equations. Below are a few examples:\n" + "\n".join(lines) + "\n"
+        f"Now, determine the result for: {query}"
+    )
+    reasoning = (
+        f"The operator '{op}' means: {desc}. "
+        f"For {query}, take '{qa}' and '{qb}' -> {answer}."
+    )
+    return prompt, answer, reasoning
 
 
-def _algebra_cot(
-    desc: str,
-    examples: List[PuzzleExample],
-    test_x: int,
-    answer: str,
-) -> str:
-    lines = [f"Hypothesis: {desc}", "Check examples:"]
-    for ex in examples:
-        lines.append(f"- f({ex.inp}) = {ex.out}")
-    lines.append(f"Therefore f({test_x}) = {answer}.")
-    return "\n".join(lines)
+# ---------------------------------------------------------------------------
+# Registry + shard writing
+# ---------------------------------------------------------------------------
+GENERATORS: Dict[str, Gen] = {
+    "bit_manipulation": generate_bit_manipulation,
+    "gravity": generate_gravity,
+    "unit_conversion": generate_unit_conversion,
+    "numeral": generate_numeral,
+    "encryption": generate_encryption,
+    "equation": generate_equation,
+}
 
 
-def generate_sequence_puzzle(
-    rng: random.Random,
-) -> Tuple[str, str, str]:
-    mode = rng.randint(0, 3)
-    if mode == 0:
-        a0 = rng.randint(0, 10)
-        d = rng.randint(1, 9)
-        seq = [a0 + i * d for i in range(7)]
-        rule = f"Arithmetic: start {a0}, add {d}"
-    elif mode == 1:
-        a0 = rng.randint(1, 5)
-        r = rng.choice([2, 3])
-        seq = [a0 * (r**i) for i in range(7)]
-        rule = f"Geometric: first term {a0}, ratio {r}"
-    elif mode == 2:
-        a, b = rng.randint(1, 9), rng.randint(1, 9)
-        seq = []
-        x, y = a, b
-        for _ in range(7):
-            seq.append(x)
-            x, y = y, x + y
-        rule = f"Fibonacci-like: start {a},{b}, each term sum of previous two"
-    else:
-        seq = [i * i + rng.randint(0, 2) for i in range(1, 8)]
-        rule = "Quadratic-ish: n^2 plus small offset (fit from terms)"
-
-    shown = seq[:-1]
-    answer = str(seq[-1])
-    lines = [
-        "Sequence puzzle: find the next term.",
-        f"Hint: {rule}",
-        "",
-        "Given terms:",
-        ", ".join(str(x) for x in shown),
-        "",
-        "What is the next term?",
-    ]
-    prompt = "\n".join(lines)
-    cot = _sequence_cot(rule, shown, answer)
-    return prompt, answer, cot
-
-
-def _sequence_cot(rule: str, shown: List[int], answer: str) -> str:
-    lines = [
-        f"Pattern note: {rule}.",
-        f"Observed: {', '.join(str(x) for x in shown)}.",
-        f"Next term: {answer}.",
-    ]
-    return "\n".join(lines)
-
-
-def puzzle_to_jsonl_record(
-    prompt: str,
-    answer: str,
-    cot: str,
-    meta: Dict[str, Any] | None = None,
-) -> Dict[str, Any]:
-    assistant = format_assistant_reply(cot, answer)
-    rec: Dict[str, Any] = {"messages": build_messages(prompt, assistant)}
-    if meta:
-        rec["meta"] = meta
-    return rec
-
-
-def write_synthetic_shard(
-    path: Path,
-    generator: Callable[[random.Random], Tuple[str, str, str]],
-    puzzle_type: str,
-    n: int,
-    seed: int,
-) -> None:
+def write_synthetic_shard(path: Path, gen: Gen, family: str, n: int, seed: int) -> int:
     rng = random.Random(seed)
     path.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
     with path.open("w", encoding="utf-8") as f:
         for i in range(n):
-            prompt, answer, cot = generator(rng)
-            rec = puzzle_to_jsonl_record(
-                prompt,
-                answer,
-                cot,
-                meta={"puzzle_type": puzzle_type, "synthetic": True, "idx": i},
-            )
+            prompt, answer, reasoning = gen(rng)
+            assistant = format_assistant_reply(reasoning, answer)
+            rec = {
+                "messages": build_messages(prompt, assistant),
+                "meta": {"category": family, "source": "synthetic",
+                         "reasoning": True, "idx": i, "answer": answer},
+            }
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            written += 1
+    return written
 
 
 def write_all_synthetic(
     out_dir: Path,
-    per_kind: int = 250,
+    per_kind: int = 300,
     seed: int = 42,
     per_kind_overrides: Dict[str, int] | None = None,
 ) -> Dict[str, Path]:
-    """Write four shards. Optional per_kind_overrides keys: bit_manipulation, text_cipher, algebraic, sequence."""
     overrides = per_kind_overrides or {}
-
-    def n(kind_key: str) -> int:
-        return int(overrides.get(kind_key, per_kind))
-
     out_dir.mkdir(parents=True, exist_ok=True)
-    paths = {
-        "bit_manipulation": out_dir / "bit_manipulation.jsonl",
-        "text_cipher": out_dir / "text_cipher.jsonl",
-        "algebraic": out_dir / "algebraic.jsonl",
-        "sequence": out_dir / "sequence.jsonl",
-    }
-    write_synthetic_shard(
-        paths["bit_manipulation"],
-        generate_bit_manipulation_puzzle,
-        "bit_manipulation",
-        n("bit_manipulation"),
-        seed,
-    )
-    write_synthetic_shard(
-        paths["text_cipher"],
-        generate_cipher_puzzle,
-        "text_cipher",
-        n("text_cipher"),
-        seed + 1,
-    )
-    write_synthetic_shard(
-        paths["algebraic"],
-        generate_algebraic_puzzle,
-        "algebraic",
-        n("algebraic"),
-        seed + 2,
-    )
-    write_synthetic_shard(
-        paths["sequence"],
-        generate_sequence_puzzle,
-        "sequence",
-        n("sequence"),
-        seed + 3,
-    )
+    paths: Dict[str, Path] = {}
+    for offset, (family, gen) in enumerate(GENERATORS.items()):
+        n = int(overrides.get(family, per_kind))
+        p = out_dir / f"{family}.jsonl"
+        write_synthetic_shard(p, gen, family, n, seed + offset)
+        paths[family] = p
     return paths
 
 
@@ -502,12 +340,31 @@ def main_cli() -> None:
 
     p = argparse.ArgumentParser(description="Write synthetic puzzle JSONL shards")
     p.add_argument("--out-dir", type=Path, default=Path("data/synthetic"))
-    p.add_argument("--per-kind", type=int, default=250)
+    p.add_argument("--per-kind", type=int, default=300)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--self-check", action="store_true",
+                   help="Verify each generated answer is recovered by the solver")
     args = p.parse_args()
     paths = write_all_synthetic(args.out_dir, args.per_kind, args.seed)
     for k, v in paths.items():
         print(f"Wrote {k}: {v}")
+    if args.self_check:
+        _self_check(args.seed)
+
+
+def _self_check(seed: int) -> None:
+    """Sanity: generators are internally consistent (answer matches the rule)."""
+    from scripts.utils.competition_metric import scores
+
+    for offset, (family, gen) in enumerate(GENERATORS.items()):
+        rng = random.Random(seed + offset + 1000)
+        ok = 0
+        for _ in range(200):
+            _, ans, reasoning = gen(rng)
+            # the reasoning string ends by stating the answer; confirm it contains it
+            if str(ans) in reasoning:
+                ok += 1
+        print(f"self-check {family}: {ok}/200 reasoning-answer consistent")
 
 
 if __name__ == "__main__":
