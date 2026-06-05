@@ -28,22 +28,27 @@ import modal
 
 REPO = "https://github.com/SebAustin/NVIDIA-Nemotron-Model-Reasoning-Challenge"
 BRANCH = "build/nemotron-pipeline"
-TORCH = "torch==2.6.0"          # has prebuilt mamba/causal-conv1d cp312 wheels (cu12)
+TORCH = "torch==2.6.0"          # cu124; mamba/causal-conv1d built from source against it
+CUDA_TAG = "12.4.1-devel-ubuntu22.04"   # devel image => nvcc available to build mamba
 
+# Build mamba_ssm + causal_conv1d FROM SOURCE against this exact torch (prebuilt
+# wheels' c10 symbols don't reliably match), targeting A100 (sm_80).
 image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .apt_install("git")
+    modal.Image.from_registry(f"nvidia/cuda:{CUDA_TAG}", add_python="3.12")
+    .apt_install("git", "build-essential")
     .pip_install(
         TORCH,
         "transformers>=4.45,<5", "peft", "trl", "datasets", "accelerate",
         "bitsandbytes", "psutil", "pandas", "numpy", "sentencepiece",
-        "huggingface_hub", "hf_transfer", "einops",  # einops: required by mamba_ssm
+        "huggingface_hub", "hf_transfer", "einops", "ninja", "packaging",
     )
     .run_commands(
         f"git clone -b {BRANCH} {REPO} /repo",
-        # fetch + install mamba_ssm / causal_conv1d wheels matching the installed torch
-        "cd /repo && python kaggle_wheels/fetch_torch_locked_wheels.py --dest /wheels",
-        "pip install --no-deps /wheels/causal_conv1d-*.whl /wheels/mamba_ssm-*.whl",
+        "CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS=4 TORCH_CUDA_ARCH_LIST=8.0 "
+        "CUDA_HOME=/usr/local/cuda pip install --no-build-isolation causal-conv1d",
+        "MAMBA_FORCE_BUILD=TRUE MAX_JOBS=4 TORCH_CUDA_ARCH_LIST=8.0 "
+        "CUDA_HOME=/usr/local/cuda pip install --no-build-isolation mamba-ssm",
+        "python -c 'import causal_conv1d, mamba_ssm; print(\"mamba build OK\")'",
     )
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "PYTHONUNBUFFERED": "1"})
 )

@@ -159,12 +159,22 @@ def verify_target_modules(model, regex: str) -> List[str]:
     return matched
 
 
-def build_peft_model(model, r: int, alpha: int, target_regex: str):
+def build_peft_model(model, r: int, alpha: int, target_regex: str, load_8bit: bool):
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
-    model = prepare_model_for_kbit_training(
-        model, use_gradient_checkpointing=True
-    )
+    if load_8bit:
+        # int8 training needs fp32 upcasting of norms/LoRA for stability
+        model = prepare_model_for_kbit_training(
+            model, use_gradient_checkpointing=True
+        )
+        autocast_adapter = True
+    else:
+        # pure bf16: keep the LoRA adapter in bf16 so the MoE residual add does
+        # not mix bf16 (stream) with fp32 (adapter output) -> index_add_ dtype error
+        model.gradient_checkpointing_enable()
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+        autocast_adapter = False
     cfg = LoraConfig(
         r=r,
         lora_alpha=alpha,
@@ -173,7 +183,7 @@ def build_peft_model(model, r: int, alpha: int, target_regex: str):
         bias="none",
         task_type="CAUSAL_LM",
     )
-    model = get_peft_model(model, cfg)
+    model = get_peft_model(model, cfg, autocast_adapter_dtype=autocast_adapter)
     model.print_trainable_parameters()
     return model
 
@@ -375,7 +385,7 @@ def main() -> None:
 
         model, tok = load_base_model(args.offload_dir, model_src, load_8bit)
         verify_target_modules(model, target_regex)
-        model = build_peft_model(model, r, alpha, target_regex)
+        model = build_peft_model(model, r, alpha, target_regex, load_8bit)
         full_ds = to_text_dataset(records, tok)
         collator = completion_collator(tok)
         probe = PerCategoryLogprobProbe(tok, records)
