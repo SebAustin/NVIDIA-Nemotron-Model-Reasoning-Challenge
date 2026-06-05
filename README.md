@@ -31,16 +31,17 @@ For vLLM evaluation only, use a separate env with `requirements-vllm.txt` if nee
 ## Run order
 
 ```bash
-python scripts/01_eda.py --data-dir data --report-dir data/reports
-python scripts/02_prepare_data.py --data-dir data --skip-cot  # or configure API for full CoT
+python scripts/01_eda.py --data-dir data            # -> data/train_categorized.csv (+ report)
+python scripts/02_prepare_data.py --data-dir data   # -> data/train_sft.jsonl  (no API needed)
 python scripts/03_train_lora.py --data-path data/train_sft.jsonl --output-dir lora_adapter
 python scripts/04_evaluate.py --adapter-path lora_adapter --data-dir data
-python scripts/05_package_submission.py --adapter-dir lora_adapter
+python scripts/05_package_submission.py --adapter-dir lora_adapter   # -> submission.zip
 ```
 
-On Kaggle (after `kagglehub.model_download`), prefer: `--model-path <cache> --no-quant --lora-target-mode kaggle_nemotron --lora-alpha 16 --force-peft` (see **Kaggle** section).
-
-Use `--help` on each script for options.
+Phases 1–2 run locally with just pandas/numpy (tokenizer optional). Phases 3–4
+need a GPU (Kaggle 2×T4, or rent an A100/H100 — see `FALLBACK.md` if the T4 run
+OOMs). **See [WRITEUP.md](WRITEUP.md) for the full method, verified ground truth,
+and per-family results.** Use `--help` on each script for options.
 
 ## Kaggle
 
@@ -65,6 +66,14 @@ Still enforce this repo’s constraints where they matter (**`transformers>=4.45
 
 ## Notes
 
-- Base model: `nvidia/Nemotron-3-Nano-30B-A3B-BF16` (LoRA rank ≤ 32).
-- Training uses Unsloth when import succeeds (HF id + 4-bit); otherwise PEFT. Use `--no-quant` for full bf16 weights (e.g. Kaggle Hub cache).
-- `02_prepare_data.py` can generate synthetic-only data with `--skip-cot` for a quick baseline without API calls.
+- Base model: **`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`** (31.6B `nemotron_h`
+  hybrid Mamba; LoRA rank ≤ 32). The `NVIDIA-` prefix is required.
+- Training is **HF PEFT + TRL** with **8-bit** load + CPU/disk offload (4-bit QLoRA
+  is unreliable on this hybrid model). `target_modules` default to the official
+  demo regex `in_proj|out_proj|up_proj|down_proj` (never the MoE router).
+- `02_prepare_data.py` needs **no external API**: reasoning traces are generated
+  deterministically by per-family solvers (`scripts/utils/solvers.py`) plus
+  synthetic puzzles with known rules.
+- The eval/answer format matches the competition exactly: no system prompt, a
+  `\boxed{}` suffix on the user turn, `<think>` reasoning, greedy decoding,
+  exact-or-rel-tol-1e-2 scoring.
