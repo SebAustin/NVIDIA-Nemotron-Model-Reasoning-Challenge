@@ -179,6 +179,51 @@ def maybe_force_torch_forward() -> None:
           f"module(s); GPU caps={caps}")
 
 
+def patch_moe_dtype() -> None:
+    """NemotronHMOE.moe accumulates into a bf16 tensor via index_add_ but the
+    per-expert ``weighted_output`` can be fp32 (autocast) -> dtype error. Replace
+    ``moe`` with a version that casts to the accumulator dtype before index_add_."""
+    import sys
+
+    import torch
+
+    def _safe_moe(self, hidden_states, topk_indices, topk_weights):
+        final_hidden_states = torch.zeros_like(hidden_states, dtype=topk_weights.dtype)
+        expert_mask = torch.nn.functional.one_hot(
+            topk_indices, num_classes=len(self.experts)
+        ).permute(2, 0, 1)
+        for expert_idx in range(len(self.experts)):
+            expert = self.experts[expert_idx]
+            mask = expert_mask[expert_idx]
+            token_indices, weight_indices = torch.where(mask)
+            if token_indices.numel() > 0:
+                expert_weights = topk_weights[token_indices, weight_indices]
+                expert_output = expert(hidden_states[token_indices])
+                weighted_output = expert_output * expert_weights.unsqueeze(-1)
+                final_hidden_states.index_add_(
+                    0, token_indices, weighted_output.to(final_hidden_states.dtype)
+                )
+            else:
+                expert_dtype = expert.down_proj.weight.dtype
+                dummy_out = expert(
+                    torch.zeros_like(hidden_states[0]).unsqueeze(0).to(expert_dtype)
+                )
+                final_hidden_states = final_hidden_states + dummy_out.to(
+                    final_hidden_states.dtype
+                )
+        return final_hidden_states.type(hidden_states.dtype)
+
+    patched = 0
+    for name, mod in list(sys.modules.items()):
+        if name.endswith("modeling_nemotron_h"):
+            cls = getattr(mod, "NemotronHMOE", None)
+            if cls is not None:
+                cls.moe = _safe_moe
+                patched += 1
+    if patched:
+        print(f"[lora] patched NemotronHMOE.moe for dtype-safe index_add_ ({patched})")
+
+
 def verify_target_modules(model, regex: str) -> List[str]:
     """Return the module names matched by `regex`; abort if it hits the router."""
     pat = re.compile(regex)
@@ -427,6 +472,7 @@ def main() -> None:
 
         model, tok = load_base_model(args.offload_dir, model_src, quant)
         maybe_force_torch_forward()
+        patch_moe_dtype()
         verify_target_modules(model, target_regex)
         model = build_peft_model(model, r, alpha, target_regex)
         full_ds = to_text_dataset(records, tok)
