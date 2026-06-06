@@ -204,10 +204,9 @@ def patch_moe_dtype() -> None:
                     0, token_indices, weighted_output.to(final_hidden_states.dtype)
                 )
             else:
-                expert_dtype = expert.down_proj.weight.dtype
-                dummy_out = expert(
-                    torch.zeros_like(hidden_states[0]).unsqueeze(0).to(expert_dtype)
-                )
+                # feed the dummy in the ACTIVATION dtype (hidden_states), not the
+                # weight dtype — a 4-bit layer's .weight is packed uint8.
+                dummy_out = expert(torch.zeros_like(hidden_states[0]).unsqueeze(0))
                 final_hidden_states = final_hidden_states + dummy_out.to(
                     final_hidden_states.dtype
                 )
