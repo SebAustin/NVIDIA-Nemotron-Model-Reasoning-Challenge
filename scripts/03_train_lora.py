@@ -149,6 +149,36 @@ def load_base_model(offload_dir: Path, model_src: str, quant: str = "8bit"):
     return model, tok
 
 
+def maybe_force_torch_forward() -> None:
+    """On pre-Ampere GPUs (T4/sm_75) the Mamba-2 SSD Triton kernels fail to
+    compile ('Unsupported conversion from bf16 to f16'). Force the model's
+    pure-PyTorch ``torch_forward`` path by flipping the dynamic module's
+    ``is_fast_path_available`` global to False. Set FORCE_TORCH_FORWARD=0 to skip."""
+    import sys
+
+    if os.environ.get("FORCE_TORCH_FORWARD", "auto") == "0":
+        return
+    caps = []
+    try:
+        import torch
+
+        caps = [torch.cuda.get_device_capability(i)
+                for i in range(torch.cuda.device_count())]
+        pre_ampere = any(c < (8, 0) for c in caps)
+    except Exception:
+        pre_ampere = False
+    force = os.environ.get("FORCE_TORCH_FORWARD") == "1" or pre_ampere
+    if not force:
+        return
+    patched = 0
+    for name, mod in list(sys.modules.items()):
+        if name.endswith("modeling_nemotron_h") and hasattr(mod, "is_fast_path_available"):
+            mod.is_fast_path_available = False
+            patched += 1
+    print(f"[lora] forced torch_forward (disabled Mamba fast path) on {patched} "
+          f"module(s); GPU caps={caps}")
+
+
 def verify_target_modules(model, regex: str) -> List[str]:
     """Return the module names matched by `regex`; abort if it hits the router."""
     pat = re.compile(regex)
@@ -396,6 +426,7 @@ def main() -> None:
         from trl import SFTTrainer
 
         model, tok = load_base_model(args.offload_dir, model_src, quant)
+        maybe_force_torch_forward()
         verify_target_modules(model, target_regex)
         model = build_peft_model(model, r, alpha, target_regex)
         full_ds = to_text_dataset(records, tok)
