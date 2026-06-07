@@ -76,7 +76,11 @@ def train():
     import subprocess
     import urllib.request
 
-    os.chdir("/repo")
+    # clone fresh at RUNTIME so the latest patched trainer is used (the build-time
+    # clone is cached and may be stale)
+    subprocess.run("rm -rf /tmp/repo", shell=True, check=False)
+    subprocess.run(["git", "clone", "-b", BRANCH, REPO, "/tmp/repo"], check=True)
+    os.chdir("/tmp/repo")
     os.makedirs("data", exist_ok=True)
 
     # 1) competition data via the Kaggle KGAT bearer token
