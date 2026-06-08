@@ -46,7 +46,11 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 MODEL_ID = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
-DEFAULT_TARGET_REGEX = r".*\.(in_proj|out_proj|up_proj|down_proj)$"
+# out_proj is consumed RAW by the fused Mamba kernel (F.linear on its weight), which
+# breaks if it's quantized AND bypasses any LoRA on it — so we keep out_proj bf16
+# (skip-quantized) and LoRA in_proj/up_proj/down_proj (all applied as real modules).
+DEFAULT_TARGET_REGEX = r".*\.(in_proj|up_proj|down_proj)$"
+SKIP_QUANT_MODULES = ["out_proj"]
 FORBIDDEN_SUBSTRINGS = ("router", "gate", "expert_gate", "lm_head")  # never LoRA the router
 
 
@@ -135,6 +139,7 @@ def load_base_model(offload_dir: Path, model_src: str, quant: str = "8bit"):
         kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_8bit=True,
             llm_int8_enable_fp32_cpu_offload=True,
+            llm_int8_skip_modules=SKIP_QUANT_MODULES,  # out_proj must stay bf16 for the fused kernel
         )
     elif quant == "4bit":
         kwargs["quantization_config"] = BitsAndBytesConfig(
@@ -143,6 +148,7 @@ def load_base_model(offload_dir: Path, model_src: str, quant: str = "8bit"):
             bnb_4bit_use_double_quant=True,
             bnb_4bit_compute_dtype=torch.bfloat16,  # keep MoE math in bf16
             llm_int8_enable_fp32_cpu_offload=True,  # tolerate CPU spill on small GPUs
+            llm_int8_skip_modules=SKIP_QUANT_MODULES,  # out_proj must stay bf16 for the fused kernel
         )
     # else 'none': bf16 weights straight onto a big GPU (A100/H100 80GB)
     model = AutoModelForCausalLM.from_pretrained(model_src, **kwargs)
