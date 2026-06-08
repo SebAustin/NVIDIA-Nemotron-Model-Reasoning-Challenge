@@ -251,18 +251,13 @@ def verify_target_modules(model, regex: str) -> List[str]:
 def build_peft_model(model, r: int, alpha: int, target_regex: str):
     from peft import LoraConfig, get_peft_model
 
-    # NOTE: deliberately NOT calling prepare_model_for_kbit_training. It upcasts
-    # layernorms to fp32, which makes this model's custom MoE add a fp32 expert
-    # output into the bf16 residual stream (index_add_ dtype error). We set up
-    # gradient checkpointing + input grads manually and keep the adapter in bf16
-    # (autocast_adapter_dtype=False) so EVERYTHING stays bf16 — works for 4bit /
-    # 8bit / bf16 alike.
+    # NOTE: deliberately NOT calling prepare_model_for_kbit_training — it upcasts
+    # layernorms to fp32, which clashes with the bf16 LoRA / fused Mamba kernel. We
+    # keep everything bf16 (autocast_adapter_dtype=False) and set up grad
+    # checkpointing + input-require-grads AFTER get_peft_model (the canonical order;
+    # with use_reentrant=False the block INPUT must require grad, not just the LoRA
+    # params inside it).
     model.config.use_cache = False
-    model.gradient_checkpointing_enable(
-        gradient_checkpointing_kwargs={"use_reentrant": False}
-    )
-    if hasattr(model, "enable_input_require_grads"):
-        model.enable_input_require_grads()
     cfg = LoraConfig(
         r=r,
         lora_alpha=alpha,
@@ -272,6 +267,10 @@ def build_peft_model(model, r: int, alpha: int, target_regex: str):
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, cfg, autocast_adapter_dtype=False)
+    model.enable_input_require_grads()
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
     model.print_trainable_parameters()
     return model
 
