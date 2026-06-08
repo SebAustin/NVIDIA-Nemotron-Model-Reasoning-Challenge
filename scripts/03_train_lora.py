@@ -267,10 +267,14 @@ def build_peft_model(model, r: int, alpha: int, target_regex: str):
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, cfg, autocast_adapter_dtype=False)
-    model.enable_input_require_grads()
-    model.gradient_checkpointing_enable(
-        gradient_checkpointing_kwargs={"use_reentrant": False}
-    )
+    # Gradient checkpointing OFF by default: this model's custom checkpoint path +
+    # the fused Mamba kernel breaks grad flow ("element 0 ... does not require grad").
+    # Without it the LoRA params build a normal graph. Set GRAD_CHECKPOINT=1 to re-enable.
+    if os.environ.get("GRAD_CHECKPOINT", "0") == "1":
+        model.enable_input_require_grads()
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
     model.print_trainable_parameters()
     return model
 
@@ -318,7 +322,9 @@ def make_sft_config(output_dir, max_seq_len, epochs, lr, bsz, accum, **extra):
         logging_steps=10,
         save_strategy="no",
         bf16=True,
-        gradient_checkpointing=True,
+        # Keep this in sync with build_peft_model: OFF by default for this model
+        # (checkpointing + fused Mamba kernel breaks LoRA grad flow). GRAD_CHECKPOINT=1 re-enables.
+        gradient_checkpointing=os.environ.get("GRAD_CHECKPOINT", "0") == "1",
         gradient_checkpointing_kwargs={"use_reentrant": False},
         report_to="none",
         optim="paged_adamw_8bit",
