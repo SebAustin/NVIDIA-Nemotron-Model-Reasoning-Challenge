@@ -432,6 +432,62 @@ Config at failure: {json.dumps(cfg, indent=2)}
     print("Wrote FALLBACK.md")
 
 
+def diagnose_grad(model, tokenizer, record) -> None:
+    """One-shot grad-flow probe: localize why loss.requires_grad is False.
+    Set DIAGNOSE_GRAD=1 to run this instead of training, then exits."""
+    import torch
+
+    model.train()
+    text = tokenizer.apply_chat_template(
+        record["messages"], tokenize=False, add_generation_prompt=False
+    )
+    enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=256)
+    enc = {k: v.to(model.device) for k, v in enc.items()}
+    enc["labels"] = enc["input_ids"].clone()
+
+    trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    print(f"[diag] trainable tensors: {len(trainable)}")
+    if trainable:
+        n0, p0 = trainable[0]
+        print(f"[diag] sample trainable: {n0} dtype={p0.dtype} device={p0.device} "
+              f"is_leaf={p0.is_leaf}")
+
+    # --- inspect one wrapped in_proj LoRA module directly ---
+    for n, m in model.named_modules():
+        if n.endswith("in_proj") and hasattr(m, "lora_A"):
+            keys = list(m.lora_A.keys())
+            print(f"[diag] {n}: active_adapters={getattr(m, 'active_adapters', '?')} "
+                  f"merged={getattr(m, 'merged', '?')} "
+                  f"disable={getattr(m, '_disable_adapters', '?')} lora_keys={keys}")
+            la = m.lora_A[keys[0]]
+            print(f"[diag]   lora_A.weight: dtype={la.weight.dtype} "
+                  f"requires_grad={la.weight.requires_grad}")
+            try:
+                x = torch.randn(1, 4, m.in_features,
+                                dtype=la.weight.dtype, device=la.weight.device,
+                                requires_grad=True)
+                y = m(x)
+                print(f"[diag]   direct module forward: out.requires_grad="
+                      f"{y.requires_grad} grad_fn={type(y.grad_fn).__name__ if y.grad_fn else None}")
+            except Exception as e:
+                print(f"[diag]   direct module forward FAILED: {type(e).__name__}: {e}")
+            break
+
+    # --- full forward ---
+    out = model(**enc)
+    loss = out.loss
+    logits = getattr(out, "logits", None)
+    print(f"[diag] logits.requires_grad="
+          f"{None if logits is None else logits.requires_grad}")
+    print(f"[diag] loss={float(loss):.4f} requires_grad={loss.requires_grad} "
+          f"grad_fn={type(loss.grad_fn).__name__ if loss.grad_fn else None}")
+    if loss.requires_grad:
+        loss.backward()
+        got = sum(1 for _, p in trainable if p.grad is not None)
+        print(f"[diag] params WITH grad after backward: {got}/{len(trainable)}")
+    raise SystemExit("[diag] done — remove DIAGNOSE_GRAD to train")
+
+
 def is_oom(exc: BaseException) -> bool:
     s = f"{type(exc).__name__}: {exc}".lower()
     return "out of memory" in s or "cuda oom" in s or "cublas" in s or "alloc" in s
@@ -486,6 +542,8 @@ def main() -> None:
         patch_moe_dtype()
         verify_target_modules(model, target_regex)
         model = build_peft_model(model, r, alpha, target_regex)
+        if os.environ.get("DIAGNOSE_GRAD") == "1":
+            diagnose_grad(model, tok, records[0])
         full_ds = to_text_dataset(records, tok)
         collator = completion_collator(tok)
         probe = PerCategoryLogprobProbe(tok, records)
