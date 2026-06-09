@@ -579,7 +579,24 @@ def main() -> None:
         collator = completion_collator(tok)
         probe = PerCategoryLogprobProbe(tok, records)
 
-        def run(ds, epochs_, max_steps, tag):
+        from transformers import TrainerCallback
+
+        class PeriodicAdapterSave(TrainerCallback):
+            """Save the (small) adapter every N optimizer steps so a disconnect or
+            running out of compute units still leaves a usable adapter on disk.
+            Point --output-dir at a durable path (e.g. Google Drive)."""
+
+            def __init__(self, every):
+                self.every = every
+
+            def on_step_end(self, a, state, control, **kw):
+                if self.every and state.global_step and state.global_step % self.every == 0:
+                    args.output_dir.mkdir(parents=True, exist_ok=True)
+                    model.save_pretrained(str(args.output_dir))
+                    tok.save_pretrained(str(args.output_dir))
+                    print(f"[lora] checkpoint @ step {state.global_step} -> {args.output_dir}")
+
+        def run(ds, epochs_, max_steps, tag, save_every=0):
             sft_cfg = make_sft_config(
                 args.output_dir, max_seq, epochs_, lr, bsz, accum,
                 **({"max_steps": max_steps} if max_steps else {}),
@@ -591,6 +608,8 @@ def main() -> None:
                 model=model, args=sft_cfg, train_dataset=ds,
                 processing_class=tok, **kw,
             )
+            if save_every:
+                trainer.add_callback(PeriodicAdapterSave(save_every))
             print(f"[lora] === {tag} ===")
             trainer.train()
             return trainer
@@ -607,8 +626,12 @@ def main() -> None:
             if args.smoke_only:
                 return
 
-        # 2) full run
-        run(full_ds, epochs, 0, f"FULL TRAIN ({len(full_ds)} rows, {epochs} epochs)")
+        # 2) full run — periodic adapter saves so partial progress survives a
+        # disconnect / out-of-units (SAVE_STEPS optimizer steps; default every 100).
+        save_every = int(os.environ.get("SAVE_STEPS", "100"))
+        max_steps = int(os.environ.get("MAX_STEPS", "0"))
+        run(full_ds, epochs, max_steps,
+            f"FULL TRAIN ({len(full_ds)} rows, {epochs} epochs)", save_every=save_every)
 
         mins = probe(model)
         print("\n[lora] FINAL min-logprob by category:")
