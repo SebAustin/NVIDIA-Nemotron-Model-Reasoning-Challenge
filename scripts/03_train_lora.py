@@ -341,7 +341,9 @@ def make_sft_config(output_dir, max_seq_len, epochs, lr, bsz, accum, **extra):
         gradient_checkpointing=os.environ.get("GRAD_CHECKPOINT", "0") == "1",
         gradient_checkpointing_kwargs={"use_reentrant": False},
         report_to="none",
-        optim="paged_adamw_8bit",
+        # paged_adamw_8bit needs bitsandbytes; on a big-VRAM card (e.g. 96GB Blackwell)
+        # set OPTIM=adamw_torch to avoid the bnb dependency entirely.
+        optim=os.environ.get("OPTIM", "paged_adamw_8bit"),
         dataset_text_field="text",
         **extra,
     )
