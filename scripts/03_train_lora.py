@@ -50,7 +50,13 @@ MODEL_ID = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 # breaks if it's quantized AND bypasses any LoRA on it — so we keep out_proj bf16
 # (skip-quantized) and LoRA in_proj/up_proj/down_proj (all applied as real modules).
 DEFAULT_TARGET_REGEX = r".*\.(in_proj|up_proj|down_proj)$"
-SKIP_QUANT_MODULES = ["out_proj"]
+# lm_head MUST stay unquantized: the CausalLM forward does
+#   logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)).float()
+# If lm_head is 4-bit, weight.dtype is uint8 and that .to(uint8) cast is a
+# non-differentiable float->int cast that silently DETACHES the graph -> loss has
+# no grad_fn. Passing llm_int8_skip_modules overrides transformers' default
+# keep-list, so we must list lm_head (and the tied embeddings) ourselves.
+SKIP_QUANT_MODULES = ["out_proj", "lm_head", "embeddings", "embed_tokens"]
 FORBIDDEN_SUBSTRINGS = ("router", "gate", "expert_gate", "lm_head")  # never LoRA the router
 
 
