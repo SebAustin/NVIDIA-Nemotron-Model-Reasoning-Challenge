@@ -254,8 +254,8 @@ def verify_target_modules(model, regex: str) -> List[str]:
     return matched
 
 
-def build_peft_model(model, r: int, alpha: int, target_regex: str):
-    from peft import LoraConfig, get_peft_model
+def build_peft_model(model, r: int, alpha: int, target_regex: str, resume_dir=None):
+    from peft import LoraConfig, PeftModel, get_peft_model
 
     # NOTE: deliberately NOT calling prepare_model_for_kbit_training — it upcasts
     # layernorms to fp32, which clashes with the bf16 LoRA / fused Mamba kernel. We
@@ -264,15 +264,23 @@ def build_peft_model(model, r: int, alpha: int, target_regex: str):
     # with use_reentrant=False the block INPUT must require grad, not just the LoRA
     # params inside it).
     model.config.use_cache = False
-    cfg = LoraConfig(
-        r=r,
-        lora_alpha=alpha,
-        target_modules=target_regex,  # regex string (PEFT supports this)
-        lora_dropout=0.0,
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, cfg, autocast_adapter_dtype=False)
+    if resume_dir and Path(resume_dir).joinpath("adapter_config.json").is_file():
+        # Resume a previous run's adapter (e.g. chaining free Kaggle T4 sessions):
+        # reload its trained weights and keep training them.
+        print(f"[lora] RESUMING adapter weights from {resume_dir}")
+        model = PeftModel.from_pretrained(
+            model, str(resume_dir), is_trainable=True, autocast_adapter_dtype=False
+        )
+    else:
+        cfg = LoraConfig(
+            r=r,
+            lora_alpha=alpha,
+            target_modules=target_regex,  # regex string (PEFT supports this)
+            lora_dropout=0.0,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, cfg, autocast_adapter_dtype=False)
     # Gradient checkpointing OFF by default: this model's custom checkpoint path +
     # the fused Mamba kernel breaks grad flow ("element 0 ... does not require grad").
     # Without it the LoRA params build a normal graph. Set GRAD_CHECKPOINT=1 to re-enable.
@@ -572,7 +580,8 @@ def main() -> None:
         maybe_force_torch_forward()
         patch_moe_dtype()
         verify_target_modules(model, target_regex)
-        model = build_peft_model(model, r, alpha, target_regex)
+        resume_dir = os.environ.get("RESUME_ADAPTER") or None
+        model = build_peft_model(model, r, alpha, target_regex, resume_dir=resume_dir)
         if os.environ.get("DIAGNOSE_GRAD") == "1":
             diagnose_grad(model, tok, records[0])
         full_ds = to_text_dataset(records, tok)
