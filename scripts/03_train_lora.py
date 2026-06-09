@@ -473,8 +473,33 @@ def diagnose_grad(model, tokenizer, record) -> None:
                 print(f"[diag]   direct module forward FAILED: {type(e).__name__}: {e}")
             break
 
+    # --- per-module grad tracing: find the first True->False transition ---
+    def _rg(o):
+        if isinstance(o, torch.Tensor):
+            return o.requires_grad
+        if isinstance(o, (tuple, list)):
+            for e in o:
+                if isinstance(e, torch.Tensor):
+                    return e.requires_grad
+        return None
+
+    want = ("embeddings", "embed_tokens", "layers.0.mixer.in_proj",
+            "layers.0.mixer", "layers.0", "layers.1", "layers.2",
+            "layers.3.mixer", "norm_f", "final_layernorm", "lm_head")
+    trace = []
+    hooks = []
+    for n, m in model.named_modules():
+        if n.endswith(want):
+            hooks.append(m.register_forward_hook(
+                lambda mod, i, o, nm=n: trace.append((nm, _rg(o)))))
+
     # --- full forward ---
     out = model(**enc)
+    for h in hooks:
+        h.remove()
+    print("[diag] per-module output.requires_grad (forward order):")
+    for nm, rg in trace:
+        print(f"[diag]    {rg}  {nm}")
     loss = out.loss
     logits = getattr(out, "logits", None)
     print(f"[diag] logits.requires_grad="
