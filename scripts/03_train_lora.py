@@ -318,6 +318,55 @@ def to_text_dataset(records: List[dict], tokenizer):
     return Dataset.from_dict({"text": texts, "category": cats})
 
 
+def build_masked_dataset(records: List[dict], tokenizer, max_len: int):
+    """Completion-only loss: tokenize each conversation and mask the prompt tokens
+    (label=-100) so loss is computed only on the assistant reasoning + answer.
+
+    The prompt boundary is found the same way the probe does it: the prompt is
+    ``messages[:-1]`` rendered with ``add_generation_prompt=True``, which is a token
+    prefix of the full conversation. Works without trl's DataCollatorForCompletionOnlyLM."""
+    from datasets import Dataset
+
+    ii, ll, am, masked_all = [], [], [], 0
+    for r in records:
+        full_text = tokenizer.apply_chat_template(
+            r["messages"], tokenize=False, add_generation_prompt=False)
+        prompt_text = tokenizer.apply_chat_template(
+            r["messages"][:-1], tokenize=False, add_generation_prompt=True)
+        full_ids = tokenizer(full_text, add_special_tokens=False).input_ids[:max_len]
+        p = min(len(tokenizer(prompt_text, add_special_tokens=False).input_ids), len(full_ids))
+        labels = [-100] * p + full_ids[p:]
+        if p >= len(full_ids):
+            masked_all += 1
+        ii.append(full_ids)
+        ll.append(labels)
+        am.append([1] * len(full_ids))
+    if masked_all:
+        print(f"[lora] WARNING: {masked_all} examples fully masked (prompt >= max_len)")
+    return Dataset.from_dict({"input_ids": ii, "labels": ll, "attention_mask": am})
+
+
+def upweight_records(records: List[dict], spec: str) -> List[dict]:
+    """spec like 'equation:4,bit_manipulation:2' -> replicate those categories N times."""
+    weights: Dict[str, int] = {}
+    for part in spec.split(","):
+        if ":" in part:
+            k, _, v = part.partition(":")
+            try:
+                weights[k.strip()] = max(1, int(v))
+            except ValueError:
+                pass
+    if not weights:
+        return records
+    extra = [r for r in records
+             for _ in range(weights.get((r.get("meta") or {}).get("category"), 1) - 1)]
+    out = records + extra
+    from collections import Counter
+    dist = dict(Counter((r.get("meta") or {}).get("category", "other") for r in out))
+    print(f"[lora] upweight {weights}: {len(records)} -> {len(out)} records; dist={dist}")
+    return out
+
+
 def make_sft_config(output_dir, max_seq_len, epochs, lr, bsz, accum, **extra):
     """Construct SFTConfig, adapting to TRL versions (max_length vs max_seq_length)."""
     import inspect
@@ -586,8 +635,20 @@ def main() -> None:
         model = build_peft_model(model, r, alpha, target_regex, resume_dir=resume_dir)
         if os.environ.get("DIAGNOSE_GRAD") == "1":
             diagnose_grad(model, tok, records[0])
-        full_ds = to_text_dataset(records, tok)
-        collator = completion_collator(tok)
+        # round 2: optionally replicate weak categories (e.g. UPWEIGHT="equation:4")
+        records = upweight_records(records, os.environ.get("UPWEIGHT", ""))
+
+        # round 2: completion-only loss (mask the prompt) is ON by default now.
+        completion_only = os.environ.get("COMPLETION_ONLY", "1") == "1"
+        if completion_only:
+            from transformers import DataCollatorForSeq2Seq
+
+            full_ds = build_masked_dataset(records, tok, max_seq)
+            collator = DataCollatorForSeq2Seq(tok, label_pad_token_id=-100, padding=True)
+            print(f"[lora] completion-only loss (prompt masked) on {len(full_ds)} examples")
+        else:
+            full_ds = to_text_dataset(records, tok)
+            collator = completion_collator(tok)
         probe = PerCategoryLogprobProbe(tok, records)
 
         from transformers import TrainerCallback
@@ -608,9 +669,14 @@ def main() -> None:
                     print(f"[lora] checkpoint @ step {state.global_step} -> {args.output_dir}")
 
         def run(ds, epochs_, max_steps, tag, save_every=0):
+            cfg_extra = {"max_steps": max_steps} if max_steps else {}
+            if completion_only:
+                # dataset is already tokenized with masked labels -> tell SFTTrainer
+                # not to re-process it, and keep our input_ids/labels columns.
+                cfg_extra["remove_unused_columns"] = False
+                cfg_extra["dataset_kwargs"] = {"skip_prepare_dataset": True}
             sft_cfg = make_sft_config(
-                args.output_dir, max_seq, epochs_, lr, bsz, accum,
-                **({"max_steps": max_steps} if max_steps else {}),
+                args.output_dir, max_seq, epochs_, lr, bsz, accum, **cfg_extra,
             )
             kw = {}
             if collator is not None:
